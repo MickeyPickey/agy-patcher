@@ -12,6 +12,7 @@ import argparse
 import ctypes
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -23,7 +24,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # Byte signatures (Exact length match is mandatory)
 SIG_REGION_FROM = b"ineligible"   # 10 bytes
@@ -31,6 +32,11 @@ SIG_REGION_TO = b"inexigible"     # 10 bytes
 
 SIG_PROXY_FROM = b"https_proxy"    # 11 bytes
 SIG_PROXY_TO = b"AGY_U_PROXY"      # 11 bytes
+
+# Known alternative/legacy proxy names
+KNOWN_ALT_PROXIES = [
+    b"AG_LS_PROXY",                # 11 bytes (used by antigravity-upstream / AGUnlocker)
+]
 
 DEFAULT_PROXY_URL = "http://127.0.0.1:10808"
 ENV_VAR_AG = "AGY_U_PROXY"
@@ -447,7 +453,7 @@ def find_target_binaries(root: Optional[Path] = None) -> List[Path]:
 
 def _is_candidate_filename(name: str) -> bool:
     lower = name.lower()
-    if lower.endswith((".agtmp", ".tmp", ".bak", ".log", ".json", ".md")):
+    if lower.endswith((".agtmp", ".tmp", ".bak", ".log", ".json", ".md", ".agold", ".old")):
         return False
     if lower.startswith("language_server"):
         return True
@@ -504,11 +510,43 @@ class PatchResult:
         self.error: Optional[str] = None
 
 
+def detect_proxy_variable(data: bytes) -> Tuple[Optional[bytes], str]:
+    """
+    Detect the proxy variable name configured in the binary.
+    Returns (variable_name_bytes, kind) where kind is:
+      - 'ours': Matches SIG_PROXY_TO (AGY_U_PROXY)
+      - 'stock': Matches SIG_PROXY_FROM (https_proxy)
+      - 'foreign': Matches a known or dynamically detected 11-byte proxy variable
+      - 'unknown': Neither found nor detected
+    """
+    if SIG_PROXY_TO in data:
+        return SIG_PROXY_TO, "ours"
+    if SIG_PROXY_FROM in data:
+        return SIG_PROXY_FROM, "stock"
+
+    # Known alternative/legacy proxy names
+    for alt in KNOWN_ALT_PROXIES:
+        if alt in data:
+            return alt, "foreign"
+
+    # Dynamic heuristic detection:
+    # In Go httpproxy, getEnvAny("HTTPS_PROXY", "https_proxy") compiles into
+    # a literal table where the lowercase proxy name precedes HTTPS_PROXY.
+    candidates = re.findall(rb"([A-Za-z0-9_]{11})HTTPS_PROXY", data)
+    for c in candidates:
+        if c == b"HTTPS_PROXY":
+            continue
+        # Validate that candidate looks like a proxy variable or occurs exactly 2 times
+        cnt = data.count(c)
+        if cnt == 2 or c.upper().endswith(b"PROXY"):
+            return c, "foreign"
+
+    return None, "unknown"
+
+
 def patch_file(path: Path, unpatch: bool = False) -> PatchResult:
     """Perform in-place byte replacement on a binary file."""
     res = PatchResult(path)
-    from_region, to_region = (SIG_REGION_TO, SIG_REGION_FROM) if unpatch else (SIG_REGION_FROM, SIG_REGION_TO)
-    from_proxy, to_proxy = (SIG_PROXY_TO, SIG_PROXY_FROM) if unpatch else (SIG_PROXY_FROM, SIG_PROXY_TO)
 
     try:
         data = path.read_bytes()
@@ -516,27 +554,51 @@ def patch_file(path: Path, unpatch: bool = False) -> PatchResult:
         res.error = f"Failed to read file: {e}"
         return res
 
-    region_count = data.count(from_region)
-    proxy_count = data.count(from_proxy)
-
-    target_region_count = data.count(to_region)
-    target_proxy_count = data.count(to_proxy)
-
-    if region_count == 0 and proxy_count == 0:
-        if target_region_count > 0 or target_proxy_count > 0:
-            res.already_patched = True
-            return res
-        res.error = "Signatures not found"
-        return res
-
     new_data = data
-    if region_count > 0:
-        new_data = new_data.replace(from_region, to_region)
-        res.region_replaced = region_count
 
-    if proxy_count > 0:
-        new_data = new_data.replace(from_proxy, to_proxy)
-        res.proxy_replaced = proxy_count
+    # 1. Handle Region patch (ineligible <-> inexigible)
+    if unpatch:
+        reg_count = new_data.count(SIG_REGION_TO)
+        if reg_count > 0:
+            new_data = new_data.replace(SIG_REGION_TO, SIG_REGION_FROM)
+            res.region_replaced = reg_count
+    else:
+        reg_count = new_data.count(SIG_REGION_FROM)
+        if reg_count > 0:
+            new_data = new_data.replace(SIG_REGION_FROM, SIG_REGION_TO)
+            res.region_replaced = reg_count
+
+    # 2. Handle Proxy patch
+    proxy_sig, proxy_kind = detect_proxy_variable(new_data)
+
+    if unpatch:
+        # Revert proxy back to stock 'https_proxy'
+        if proxy_kind in ("ours", "foreign") and proxy_sig:
+            prx_count = new_data.count(proxy_sig)
+            if prx_count > 0:
+                new_data = new_data.replace(proxy_sig, SIG_PROXY_FROM)
+                res.proxy_replaced = prx_count
+    else:
+        # Apply proxy patch: migrate stock or foreign -> 'AGY_U_PROXY'
+        if proxy_kind in ("stock", "foreign") and proxy_sig:
+            prx_count = new_data.count(proxy_sig)
+            if prx_count > 0:
+                new_data = new_data.replace(proxy_sig, SIG_PROXY_TO)
+                res.proxy_replaced = prx_count
+
+    # Check if any modifications were made
+    if res.region_replaced == 0 and res.proxy_replaced == 0:
+        if unpatch:
+            if SIG_REGION_FROM in data or SIG_PROXY_FROM in data:
+                res.already_patched = True
+                return res
+        else:
+            if SIG_REGION_TO in data and SIG_PROXY_TO in data:
+                res.already_patched = True
+                return res
+
+        res.error = "Signatures not found or unrecognized"
+        return res
 
     assert len(new_data) == len(data), "Critical error: File size modified after replacement!"
 
@@ -550,9 +612,27 @@ def patch_file(path: Path, unpatch: bool = False) -> PatchResult:
         try:
             tmp_path.replace(path)
         except (PermissionError, OSError):
-            kill_locking_processes()
-            time.sleep(0.3)
-            tmp_path.replace(path)
+            # Attempt non-disruptive rename dance on Windows before resorting to process kill
+            replaced = False
+            old_path = path.with_suffix(f".{os.getpid()}.agold")
+            if is_windows():
+                try:
+                    path.rename(old_path)
+                    tmp_path.replace(path)
+                    replaced = True
+                except Exception:
+                    pass
+
+            if not replaced:
+                kill_locking_processes()
+                time.sleep(0.3)
+                tmp_path.replace(path)
+
+            if old_path.exists():
+                try:
+                    old_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
     except Exception as e:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
@@ -567,15 +647,27 @@ def get_binary_status(path: Path) -> dict:
         content = path.read_bytes()
         has_reg_mod = SIG_REGION_TO in content
         has_reg_orig = SIG_REGION_FROM in content
-        has_prx_mod = SIG_PROXY_TO in content
-        has_prx_orig = SIG_PROXY_FROM in content
+
+        proxy_sig, proxy_kind = detect_proxy_variable(content)
+        has_prx_mod = (proxy_kind == "ours")
+        has_prx_orig = (proxy_kind == "stock")
+        has_prx_foreign = (proxy_kind == "foreign")
 
         is_patched = has_reg_mod and has_prx_mod
         is_unpatched = has_reg_orig and has_prx_orig
-        is_partial = not is_patched and not is_unpatched and (has_reg_mod or has_prx_mod)
+        is_partial = not is_patched and not is_unpatched and (has_reg_mod or has_prx_mod or has_prx_foreign)
 
         reg_text = f"{Colors.GREEN}Unlocked{Colors.RESET}" if has_reg_mod else (f"{Colors.GRAY}Blocked{Colors.RESET}" if has_reg_orig else "Unknown")
-        prx_text = f"{Colors.GREEN}{ENV_VAR_AG}{Colors.RESET}" if has_prx_mod else (f"{Colors.GRAY}https_proxy{Colors.RESET}" if has_prx_orig else "Unknown")
+
+        if has_prx_mod:
+            prx_text = f"{Colors.GREEN}{ENV_VAR_AG}{Colors.RESET}"
+        elif has_prx_orig:
+            prx_text = f"{Colors.GRAY}https_proxy{Colors.RESET}"
+        elif has_prx_foreign and proxy_sig:
+            sig_name = proxy_sig.decode(errors="ignore")
+            prx_text = f"{Colors.YELLOW}{sig_name} (foreign){Colors.RESET}"
+        else:
+            prx_text = "Unknown"
 
         if is_patched:
             badge = Colors.BADGE_ENABLED
@@ -591,6 +683,8 @@ def get_binary_status(path: Path) -> dict:
             "is_patched": is_patched,
             "region": reg_text,
             "proxy": prx_text,
+            "proxy_sig": proxy_sig.decode(errors="ignore") if proxy_sig else None,
+            "proxy_kind": proxy_kind,
             "error": None
         }
     except Exception as e:
@@ -599,6 +693,8 @@ def get_binary_status(path: Path) -> dict:
             "is_patched": False,
             "region": "Error",
             "proxy": "Error",
+            "proxy_sig": None,
+            "proxy_kind": "error",
             "error": str(e)
         }
 
