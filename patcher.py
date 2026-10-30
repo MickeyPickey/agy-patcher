@@ -173,14 +173,30 @@ class Colors:
 # Keyboard Input Handler (Windows msvcrt / Linux termios)
 # ============================================================================
 
+def ensure_interactive_stdin() -> bool:
+    """Ensure sys.stdin is connected to an interactive terminal (reopens /dev/tty if piped)."""
+    if sys.stdin.isatty():
+        return True
+    if not is_windows():
+        try:
+            sys.stdin = open("/dev/tty", "r", encoding="utf-8", errors="ignore")
+            return sys.stdin.isatty()
+        except Exception:
+            return False
+    return False
+
+
 class KeyReader:
     def __init__(self):
         self.is_win = is_windows()
         if not self.is_win:
+            import select
             import termios
             import tty
+            self.select = select
             self.termios = termios
             self.tty = tty
+            ensure_interactive_stdin()
 
     def read_key(self) -> str:
         """Read a single key or key sequence (handles arrow keys)."""
@@ -217,16 +233,19 @@ class KeyReader:
                 self.tty.setcbreak(fd)
                 ch = sys.stdin.read(1)
                 if ch == "\x1b":
-                    # Escape sequence
-                    seq = sys.stdin.read(2)
-                    if seq == "[A":
-                        return "UP"
-                    elif seq == "[B":
-                        return "DOWN"
-                    elif seq == "[C":
-                        return "RIGHT"
-                    elif seq == "[D":
-                        return "LEFT"
+                    # Non-blocking check for arrow key escape sequence vs standalone ESC
+                    if self.select.select([fd], [], [], 0.05)[0]:
+                        seq1 = sys.stdin.read(1)
+                        if seq1 == "[" and self.select.select([fd], [], [], 0.05)[0]:
+                            seq2 = sys.stdin.read(1)
+                            if seq2 == "A":
+                                return "UP"
+                            elif seq2 == "B":
+                                return "DOWN"
+                            elif seq2 == "C":
+                                return "RIGHT"
+                            elif seq2 == "D":
+                                return "LEFT"
                     return "QUIT"
                 elif ch in ("\n", "\r"):
                     return "ENTER"
@@ -234,6 +253,8 @@ class KeyReader:
                     return "SPACE"
                 elif ch in ("q", "Q"):
                     return "QUIT"
+                elif ch == "\x03":
+                    raise KeyboardInterrupt
                 return ch
             finally:
                 self.termios.tcsetattr(fd, self.termios.TCSADRAIN, old_settings)
@@ -243,8 +264,45 @@ class KeyReader:
 # Environment Variable Management
 # ============================================================================
 
+def _get_linux_home_dirs() -> List[Path]:
+    """Return active user home directory plus Termux/PRoot shared home if present."""
+    homes: List[Path] = [Path.home()]
+    for extra in (Path("/data/data/com.termux/files/home"), Path("/root")):
+        try:
+            if extra.exists() and extra.is_dir() and extra not in homes:
+                homes.append(extra)
+        except Exception:
+            pass
+    return homes
+
+
+def _ensure_shell_sources_env_conf(home: Path) -> None:
+    """Ensure shell startup files load ~/.config/environment.d/agy-patcher.conf on non-systemd setups."""
+    marker = "# agy-patcher environment loader"
+    snippet = (
+        f"\n{marker}\n"
+        'if [ -f "$HOME/.config/environment.d/agy-patcher.conf" ]; then\n'
+        '    set -a; . "$HOME/.config/environment.d/agy-patcher.conf"; set +a\n'
+        "fi\n"
+    )
+    for rc_name in (".bashrc", ".zshrc"):
+        rc_path = home / rc_name
+        try:
+            if rc_path.is_file() and not rc_path.is_symlink():
+                content = rc_path.read_text(encoding="utf-8", errors="ignore")
+                if "agy-patcher.conf" not in content:
+                    rc_path.write_text(content.rstrip() + "\n" + snippet, encoding="utf-8")
+        except Exception:
+            pass
+
+
 def set_env_var(name: str, value: Optional[str]) -> bool:
     """Set or remove persistent user environment variable across Windows/Linux."""
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+
     if is_windows():
         import winreg
 
@@ -290,43 +348,50 @@ def set_env_var(name: str, value: Optional[str]) -> bool:
             )
             return res.returncode == 0
     else:
-        # Linux: write drop-in to ~/.config/environment.d and apply via systemctl
-        home = Path.home()
-        env_d = home / ".config" / "environment.d"
-        conf_file = env_d / "agy-patcher.conf"
+        # Linux: write drop-in to ~/.config/environment.d, hook shell rc, and apply via systemctl if available
         try:
-            if value is None:
-                if conf_file.exists():
-                    lines = conf_file.read_text(encoding="utf-8").splitlines()
-                    new_lines = [l for l in lines if not l.startswith(f"{name}=")]
-                    if new_lines:
-                        conf_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-                    else:
-                        conf_file.unlink()
-                subprocess.run(
-                    ["systemctl", "--user", "unset-environment", name],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False
-                )
-            else:
-                env_d.mkdir(parents=True, exist_ok=True)
-                existing = ""
-                if conf_file.exists():
-                    lines = [l for l in conf_file.read_text(encoding="utf-8").splitlines() if not l.startswith(f"{name}=")]
-                    existing = "\n".join(lines).strip()
-                new_content = f"{name}={value}\n"
-                if existing:
-                    new_content = existing + "\n" + new_content
-                conf_file.write_text(new_content, encoding="utf-8")
-                subprocess.run(
-                    ["systemctl", "--user", "set-environment", f"{name}={value}"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False
-                )
+            for home in _get_linux_home_dirs():
+                env_d = home / ".config" / "environment.d"
+                conf_file = env_d / "agy-patcher.conf"
+                if value is None:
+                    if conf_file.exists():
+                        lines = conf_file.read_text(encoding="utf-8").splitlines()
+                        new_lines = [l for l in lines if not l.startswith(f"{name}=")]
+                        if new_lines:
+                            conf_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+                        else:
+                            conf_file.unlink()
+                else:
+                    env_d.mkdir(parents=True, exist_ok=True)
+                    existing = ""
+                    if conf_file.exists():
+                        lines = [l for l in conf_file.read_text(encoding="utf-8").splitlines() if not l.startswith(f"{name}=")]
+                        existing = "\n".join(lines).strip()
+                    new_content = f"{name}={value}\n"
+                    if existing:
+                        new_content = existing + "\n" + new_content
+                    conf_file.write_text(new_content, encoding="utf-8")
+                    _ensure_shell_sources_env_conf(home)
+
+            try:
+                if value is None:
+                    subprocess.run(
+                        ["systemctl", "--user", "unset-environment", name],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False
+                    )
+                else:
+                    subprocess.run(
+                        ["systemctl", "--user", "set-environment", f"{name}={value}"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False
+                    )
+            except FileNotFoundError:
+                pass
             return True
-        except Exception as e:
+        except Exception:
             return False
 
 
@@ -343,14 +408,15 @@ def get_current_env_var(name: str) -> Optional[str]:
         except Exception:
             return os.environ.get(name)
     else:
-        conf_file = Path.home() / ".config" / "environment.d" / "agy-patcher.conf"
-        if conf_file.is_file():
-            try:
-                for line in conf_file.read_text(encoding="utf-8").splitlines():
-                    if line.startswith(f"{name}="):
-                        return line.split("=", 1)[1].strip()
-            except Exception:
-                pass
+        for home in _get_linux_home_dirs():
+            conf_file = home / ".config" / "environment.d" / "agy-patcher.conf"
+            if conf_file.is_file():
+                try:
+                    for line in conf_file.read_text(encoding="utf-8").splitlines():
+                        if line.startswith(f"{name}="):
+                            return line.split("=", 1)[1].strip()
+                except Exception:
+                    pass
         return os.environ.get(name)
 
 
@@ -401,7 +467,6 @@ def get_candidate_install_dirs() -> List[Path]:
                 pfx / "Antigravity IDE",
             ])
     else:
-        home = Path.home()
         bases = ["/opt", "/usr/share", "/usr/lib", "/usr/local/share"]
         names = ["Antigravity", "Antigravity IDE", "antigravity", "antigravity-ide"]
         for base in bases:
@@ -409,18 +474,48 @@ def get_candidate_install_dirs() -> List[Path]:
             for n in names:
                 candidates.append(b / n)
 
-        candidates.extend([
-            home / ".local" / "share" / "Antigravity",
-            home / ".local" / "share" / "Antigravity IDE",
-            home / "Antigravity",
-            home / "Antigravity IDE",
-            home / ".local" / "bin",
-            home / ".agy" / "bin",
-            home / ".agy",
-            home / ".local" / "share" / "agy" / "bin",
-        ])
+        homes = _get_linux_home_dirs()
+        # Also include PRoot distro rootfs homes when running from native Termux
+        proot_rootfs = Path("/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs")
+        try:
+            if proot_rootfs.is_dir():
+                for distro_dir in proot_rootfs.iterdir():
+                    root_home = distro_dir / "root"
+                    if root_home.is_dir() and root_home not in homes:
+                        homes.append(root_home)
+        except Exception:
+            pass
+
+        for home in homes:
+            candidates.extend([
+                home / ".local" / "share" / "Antigravity",
+                home / ".local" / "share" / "Antigravity IDE",
+                home / "Antigravity",
+                home / "Antigravity IDE",
+                home / ".local" / "bin",
+                home / ".agy" / "bin",
+                home / ".agy",
+                home / ".local" / "share" / "agy" / "bin",
+            ])
 
     return [p for p in candidates if p.exists() and p.is_dir()]
+
+
+def _is_candidate_binary(path: Path) -> bool:
+    """Return True if path is a real compiled target binary (ignoring shell wrapper scripts)."""
+    if not _is_candidate_filename(path.name):
+        return False
+    try:
+        st = path.stat()
+        # Skip tiny shell wrapper scripts (< 64 KB) or scripts starting with '#!'
+        if st.st_size < 65536:
+            with path.open("rb") as f:
+                head = f.read(2)
+            if head == b"#!" or st.st_size < 4096:
+                return False
+    except Exception:
+        return False
+    return True
 
 
 def find_target_binaries(root: Optional[Path] = None) -> List[Path]:
@@ -430,7 +525,7 @@ def find_target_binaries(root: Optional[Path] = None) -> List[Path]:
 
     for r in roots:
         if r.is_file():
-            if _is_candidate_filename(r.name):
+            if _is_candidate_binary(r):
                 targets.add(r.resolve())
             continue
 
@@ -445,7 +540,7 @@ def find_target_binaries(root: Optional[Path] = None) -> List[Path]:
             if not d.is_dir():
                 continue
             for item in d.iterdir():
-                if item.is_file() and _is_candidate_filename(item.name):
+                if item.is_file() and _is_candidate_binary(item):
                     targets.add(item.resolve())
 
     return sorted(list(targets))
@@ -742,6 +837,10 @@ class AppState:
 
 def run_interactive_tui(root_path: Optional[Path] = None):
     """Full-featured interactive TUI engine with in-memory caching and zero-flicker redraw."""
+    if not is_windows() and not ensure_interactive_stdin():
+        print("[!] Interactive terminal (/dev/tty) is not available. Run with --status or --patch for CLI mode.")
+        return
+
     reader = KeyReader()
     state = AppState(root_path)
 
@@ -989,6 +1088,11 @@ def main():
     parser.add_argument(
         "--path",
         help="Custom path to Antigravity directory or executable binary"
+    )
+    parser.add_argument(
+        "--patch",
+        action="store_true",
+        help="Apply patches for selected target"
     )
     parser.add_argument(
         "--unpatch",
