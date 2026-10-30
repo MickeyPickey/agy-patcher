@@ -231,13 +231,19 @@ class KeyReader:
             old_settings = self.termios.tcgetattr(fd)
             try:
                 self.tty.setcbreak(fd)
-                ch = sys.stdin.read(1)
+                b = os.read(fd, 1)
+                if not b:
+                    return "QUIT"
+                ch = b.decode("utf-8", errors="ignore")
                 if ch == "\x1b":
-                    # Non-blocking check for arrow key escape sequence vs standalone ESC
+                    # Non-blocking check on raw fd for arrow key escape sequence vs standalone ESC.
+                    # Must use os.read(fd, ...) rather than sys.stdin.read(1) because Python's
+                    # buffered stdin slurps the entire multi-byte sequence from the kernel buffer at once,
+                    # leaving fd empty for select().
                     if self.select.select([fd], [], [], 0.05)[0]:
-                        seq1 = sys.stdin.read(1)
-                        if seq1 == "[" and self.select.select([fd], [], [], 0.05)[0]:
-                            seq2 = sys.stdin.read(1)
+                        seq1 = os.read(fd, 1).decode("utf-8", errors="ignore")
+                        if seq1 in ("[", "O") and self.select.select([fd], [], [], 0.05)[0]:
+                            seq2 = os.read(fd, 1).decode("utf-8", errors="ignore")
                             if seq2 == "A":
                                 return "UP"
                             elif seq2 == "B":
@@ -246,6 +252,10 @@ class KeyReader:
                                 return "RIGHT"
                             elif seq2 == "D":
                                 return "LEFT"
+                        # Drain any remaining bytes of an unhandled escape sequence (e.g. PgUp/PgDn)
+                        while self.select.select([fd], [], [], 0.01)[0]:
+                            os.read(fd, 1)
+                        return "SPECIAL"
                     return "QUIT"
                 elif ch in ("\n", "\r"):
                     return "ENTER"
