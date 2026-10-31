@@ -15,16 +15,17 @@ import platform
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Byte signatures (Exact length match is mandatory)
 SIG_REGION_FROM = b"ineligible"   # 10 bytes
@@ -165,8 +166,69 @@ class Colors:
     BADGE_ENABLED = f"{GREEN}[Enabled]{RESET}"
     BADGE_DISABLED = f"{GRAY}[Disabled]{RESET}"
     BADGE_PARTIAL = f"{YELLOW}[Partial]{RESET}"
+    BADGE_SCANNING = f"{YELLOW}[Scanning]{RESET}"
     BADGE_NOT_FOUND = f"{RED}[Not Found]{RESET}"
     BADGE_ERROR = f"{RED}[Error]{RESET}"
+
+
+SPINNER_FRAMES = ("|", "/", "-", "\\")
+
+
+def _format_size(num_bytes: int) -> str:
+    """Format byte size into human-readable string (e.g., 212.8 MB)."""
+    val = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if val < 1024.0 or unit == "GB":
+            return f"{int(val)} B" if unit == "B" else f"{val:.1f} {unit}"
+        val /= 1024.0
+    return f"{val:.1f} GB"
+
+
+class CliSpinner:
+    """Lightweight animated ASCII spinner for CLI operations."""
+    def __init__(self, initial_msg: str = "Working..."):
+        self.msg = initial_msg
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._is_tty = sys.stdout.isatty()
+        self._lock = threading.Lock()
+
+    def update(self, msg: str) -> None:
+        with self._lock:
+            self.msg = msg
+
+    def _spin(self) -> None:
+        idx = 0
+        while not self._stop_event.is_set():
+            frame = SPINNER_FRAMES[idx % len(SPINNER_FRAMES)]
+            with self._lock:
+                cur_msg = self.msg
+            sys.stdout.write(f"\r  {Colors.CYAN}[{frame}]{Colors.RESET} {cur_msg}\033[K")
+            sys.stdout.flush()
+            idx += 1
+            self._stop_event.wait(0.08)
+
+    def start(self) -> "CliSpinner":
+        if self._is_tty:
+            set_cursor_visible(False)
+            self._thread = threading.Thread(target=self._spin, daemon=True)
+            self._thread.start()
+        return self
+
+    def finish(self, done_msg: Optional[str] = None, ok: bool = True) -> None:
+        if not self._is_tty:
+            return
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join()
+        if done_msg:
+            badge = f"{Colors.GREEN}[OK]{Colors.RESET}" if ok else f"{Colors.RED}[!]{Colors.RESET}"
+            sys.stdout.write(f"\r  {badge} {done_msg}\033[K")
+            sys.stdout.flush()
+            time.sleep(0.5)
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+        set_cursor_visible(True)
 
 
 # ============================================================================
@@ -306,8 +368,12 @@ def _ensure_shell_sources_env_conf(home: Path) -> None:
             pass
 
 
-def set_env_var(name: str, value: Optional[str]) -> bool:
+def set_env_var(name: str, value: Optional[str], progress_cb: Optional[Callable[[str], None]] = None) -> bool:
     """Set or remove persistent user environment variable across Windows/Linux."""
+    if progress_cb:
+        action = "Removing" if value is None else "Setting"
+        progress_cb(f"{action} {name} in user environment...")
+
     if value is None:
         os.environ.pop(name, None)
     else:
@@ -328,6 +394,9 @@ def set_env_var(name: str, value: Optional[str]) -> bool:
                 else:
                     winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
 
+            if progress_cb:
+                progress_cb(f"Broadcasting environment update ({name})...")
+
             # Broadcast WM_SETTINGCHANGE
             HWND_BROADCAST = 0xFFFF
             WM_SETTINGCHANGE = 0x001A
@@ -344,6 +413,8 @@ def set_env_var(name: str, value: Optional[str]) -> bool:
             )
             return True
         except Exception:
+            if progress_cb:
+                progress_cb(f"Applying {name} via PowerShell fallback...")
             # Fallback to PowerShell
             ps_cmd = (
                 f"[Environment]::SetEnvironmentVariable('{name}', $null, 'User')"
@@ -383,6 +454,8 @@ def set_env_var(name: str, value: Optional[str]) -> bool:
                     conf_file.write_text(new_content, encoding="utf-8")
                     _ensure_shell_sources_env_conf(home)
 
+            if progress_cb:
+                progress_cb(f"Syncing {name} with systemd user environment...")
             try:
                 if value is None:
                     subprocess.run(
@@ -649,15 +722,25 @@ def detect_proxy_variable(data: bytes) -> Tuple[Optional[bytes], str]:
     return None, "unknown"
 
 
-def patch_file(path: Path, unpatch: bool = False) -> PatchResult:
+def patch_file(
+    path: Path,
+    unpatch: bool = False,
+    progress_cb: Optional[Callable[[str], None]] = None
+) -> PatchResult:
     """Perform in-place byte replacement on a binary file."""
     res = PatchResult(path)
 
     try:
+        sz_str = _format_size(path.stat().st_size)
+        if progress_cb:
+            progress_cb(f"Reading {path.name} ({sz_str})...")
         data = path.read_bytes()
     except Exception as e:
         res.error = f"Failed to read file: {e}"
         return res
+
+    if progress_cb:
+        progress_cb(f"Scanning signatures in {path.name} ({sz_str})...")
 
     new_data = data
 
@@ -665,11 +748,15 @@ def patch_file(path: Path, unpatch: bool = False) -> PatchResult:
     if unpatch:
         reg_count = new_data.count(SIG_REGION_TO)
         if reg_count > 0:
+            if progress_cb:
+                progress_cb(f"Reverting region signature in {path.name}...")
             new_data = new_data.replace(SIG_REGION_TO, SIG_REGION_FROM)
             res.region_replaced = reg_count
     else:
         reg_count = new_data.count(SIG_REGION_FROM)
         if reg_count > 0:
+            if progress_cb:
+                progress_cb(f"Patching region signature in {path.name}...")
             new_data = new_data.replace(SIG_REGION_FROM, SIG_REGION_TO)
             res.region_replaced = reg_count
 
@@ -681,6 +768,8 @@ def patch_file(path: Path, unpatch: bool = False) -> PatchResult:
         if proxy_kind in ("ours", "foreign") and proxy_sig:
             prx_count = new_data.count(proxy_sig)
             if prx_count > 0:
+                if progress_cb:
+                    progress_cb(f"Reverting proxy signature in {path.name}...")
                 new_data = new_data.replace(proxy_sig, SIG_PROXY_FROM)
                 res.proxy_replaced = prx_count
     else:
@@ -688,6 +777,8 @@ def patch_file(path: Path, unpatch: bool = False) -> PatchResult:
         if proxy_kind in ("stock", "foreign") and proxy_sig:
             prx_count = new_data.count(proxy_sig)
             if prx_count > 0:
+                if progress_cb:
+                    progress_cb(f"Patching proxy signature in {path.name}...")
                 new_data = new_data.replace(proxy_sig, SIG_PROXY_TO)
                 res.proxy_replaced = prx_count
 
@@ -709,10 +800,15 @@ def patch_file(path: Path, unpatch: bool = False) -> PatchResult:
 
     tmp_path = path.with_suffix(f".{os.getpid()}.agtmp")
     try:
+        if progress_cb:
+            progress_cb(f"Writing temporary binary for {path.name} ({sz_str})...")
         tmp_path.write_bytes(new_data)
         if not is_windows():
             mode = path.stat().st_mode
             tmp_path.chmod(mode)
+
+        if progress_cb:
+            progress_cb(f"Replacing {path.name} on disk...")
 
         try:
             tmp_path.replace(path)
@@ -729,8 +825,12 @@ def patch_file(path: Path, unpatch: bool = False) -> PatchResult:
                     pass
 
             if not replaced:
+                if progress_cb:
+                    progress_cb(f"Stopping locking processes for {path.name}...")
                 kill_locking_processes()
                 time.sleep(0.3)
+                if progress_cb:
+                    progress_cb(f"Replacing {path.name} on disk...")
                 tmp_path.replace(path)
 
             if old_path.exists():
@@ -746,10 +846,15 @@ def patch_file(path: Path, unpatch: bool = False) -> PatchResult:
     return res
 
 
-def get_binary_status(path: Path) -> dict:
+def get_binary_status(path: Path, progress_cb: Optional[Callable[[str], None]] = None) -> dict:
     """Read binary and return structured patch status."""
     try:
+        if progress_cb:
+            sz_str = _format_size(path.stat().st_size)
+            progress_cb(f"Inspecting {path.name} ({sz_str})...")
         content = path.read_bytes()
+        if progress_cb:
+            progress_cb(f"Checking signatures in {path.name}...")
         has_reg_mod = SIG_REGION_TO in content
         has_reg_orig = SIG_REGION_FROM in content
 
@@ -810,18 +915,24 @@ def get_binary_status(path: Path) -> dict:
 
 class AppState:
     """In-memory cache for environment variables and binary inspection results."""
-    def __init__(self, root_path: Optional[Path] = None):
+    def __init__(self, root_path: Optional[Path] = None, auto_refresh: bool = True):
         self.root_path = root_path
         self.ag_env = None
         self.https_env = None
         self.ag_saved_url = DEFAULT_PROXY_URL
         self.https_saved_url = DEFAULT_PROXY_URL
-        self.apps = {}
+        self.apps: Dict[str, dict] = {
+            cat: {"target": None, "status": None, "scanning": not auto_refresh}
+            for cat in ALL_CATEGORIES
+        }
         self.custom_paths: Dict[str, Path] = {}
-        self.refresh()
+        if auto_refresh:
+            self.refresh()
 
-    def refresh(self):
+    def refresh(self, progress_cb: Optional[Callable[[str], None]] = None):
         """Perform disk scan and registry queries only when explicitly requested."""
+        if progress_cb:
+            progress_cb("Reading proxy environment variables...")
         self.ag_env = get_current_env_var(ENV_VAR_AG)
         self.https_env = get_current_env_var(ENV_VAR_HTTPS)
         if self.ag_env:
@@ -829,8 +940,9 @@ class AppState:
         if self.https_env:
             self.https_saved_url = self.https_env
 
+        if progress_cb:
+            progress_cb("Scanning installation directories for binaries...")
         grouped = get_categorized_targets(self.root_path)
-        self.apps = {}
         for cat in ALL_CATEGORIES:
             targets = grouped.get(cat, [])
             if not targets and cat in self.custom_paths:
@@ -839,10 +951,10 @@ class AppState:
                     targets = [cp]
             if targets:
                 t = targets[0]
-                st = get_binary_status(t)
-                self.apps[cat] = {"target": t, "status": st}
+                st = get_binary_status(t, progress_cb=progress_cb)
+                self.apps[cat] = {"target": t, "status": st, "scanning": False}
             else:
-                self.apps[cat] = {"target": None, "status": None}
+                self.apps[cat] = {"target": None, "status": None, "scanning": False}
 
 
 def run_interactive_tui(root_path: Optional[Path] = None):
@@ -852,7 +964,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
         return
 
     reader = KeyReader()
-    state = AppState(root_path)
+    state = AppState(root_path, auto_refresh=False)
 
     items = [
         {"type": "proxy_ag", "name": ENV_VAR_AG},
@@ -868,73 +980,123 @@ def run_interactive_tui(root_path: Optional[Path] = None):
 
     selected_idx = 0
 
-    # Clear screen ONCE at startup and hide cursor for smooth redraw
+    def render_frame(activity_line: str = "") -> None:
+        """Render the TUI frame at top-left (0,0) with an optional activity footer line."""
+        buf = [
+            "=" * 72,
+            f"               {Colors.BOLD}Antigravity Patcher & Proxy Manager v{__version__}{Colors.RESET}",
+            "=" * 72,
+            "",
+            f"  {Colors.BOLD}--- [ PROXY ENVIRONMENT VARIABLES ] ---{Colors.RESET}",
+        ]
+
+        # 0: AGY_U_PROXY
+        is_cur = (selected_idx == 0)
+        c_str = f"{Colors.CYAN}>{Colors.RESET} " if is_cur else "  "
+        ag_active = bool(state.ag_env)
+        badge = Colors.BADGE_ENABLED if ag_active else Colors.BADGE_DISABLED
+        t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
+        ag_detail = f"  {state.ag_env}" if ag_active else ""
+        buf.append(f"{c_str}{t_col}{ENV_VAR_AG:<23}{Colors.RESET}: {badge}{ag_detail}")
+
+        # 1: HTTPS_PROXY
+        is_cur = (selected_idx == 1)
+        c_str = f"{Colors.CYAN}>{Colors.RESET} " if is_cur else "  "
+        https_active = bool(state.https_env)
+        badge = Colors.BADGE_ENABLED if https_active else Colors.BADGE_DISABLED
+        t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
+        https_detail = f"  {state.https_env}" if https_active else ""
+        buf.append(f"{c_str}{t_col}{ENV_VAR_HTTPS:<23}{Colors.RESET}: {badge}{https_detail}")
+
+        buf.append("")
+        buf.append(f"  {Colors.BOLD}--- [ BINARY PATCHES ] ---{Colors.RESET}")
+
+        # Apps: 2 (Desktop), 3 (IDE), 4 (CLI)
+        for idx, cat in enumerate([AppCategory.DESKTOP, AppCategory.IDE, AppCategory.CLI], start=2):
+            is_cur = (selected_idx == idx)
+            c_str = f"{Colors.CYAN}>{Colors.RESET} " if is_cur else "  "
+            t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
+            app_info = state.apps.get(cat)
+            if app_info and app_info.get("scanning"):
+                buf.append(f"{c_str}{t_col}{cat:<23}{Colors.RESET}: {Colors.BADGE_SCANNING}")
+            elif not app_info or not app_info["target"]:
+                buf.append(f"{c_str}{t_col}{cat:<23}{Colors.RESET}: {Colors.BADGE_NOT_FOUND}")
+            else:
+                st = app_info["status"]
+                b_badge = st["badge"] if st else Colors.BADGE_ERROR
+                sub_info = f"  Reg:{st['region']} {Colors.GRAY}|{Colors.RESET} Prx:{st['proxy']}" if st else ""
+                target_path = str(app_info["target"])
+                buf.append(f"{c_str}{t_col}{cat:<23}{Colors.RESET}: {b_badge}{sub_info}  {Colors.GRAY}{target_path}{Colors.RESET}")
+
+        buf.append("")
+        buf.append(f"  {Colors.BOLD}--- [ ACTIONS ] ---{Colors.RESET}")
+        for idx in [5, 6, 7, 8]:
+            item = items[idx]
+            is_cur = (selected_idx == idx)
+            c_str = f"{Colors.CYAN}>{Colors.RESET} " if is_cur else "  "
+            t_col = f"{Colors.CYAN}{Colors.BOLD}" if is_cur else Colors.WHITE
+            buf.append(f"{c_str}{t_col}{item['title']}{Colors.RESET}")
+
+        # Dedicated status/activity footer slot above keybind hints
+        buf.append(activity_line)
+        buf.append("-" * 72)
+        buf.append("  [Up/Down] Navigate  |  [Space/Enter] Select  |  [Q] Exit")
+
+        move_cursor_home()
+        out_str = "\n".join([line + "\033[K" for line in buf]) + "\n"
+        sys.stdout.write(out_str)
+        sys.stdout.flush()
+
+    def run_with_spinner(
+        initial_msg: str,
+        task_fn: Callable[[Callable[[str], None]], Optional[Tuple[bool, str]]]
+    ) -> None:
+        """Execute task_fn in a worker thread while animating the footer spinner, then flash completion."""
+        step_lock = threading.Lock()
+        current_step = [initial_msg]
+        outcome: List[Optional[Tuple[bool, str]]] = [None]
+
+        def update_step(msg: str) -> None:
+            with step_lock:
+                current_step[0] = msg
+
+        def worker() -> None:
+            try:
+                outcome[0] = task_fn(update_step)
+            except Exception as exc:
+                outcome[0] = (False, f"Error: {exc}")
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+        frame_idx = 0
+        while t.is_alive():
+            frame = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
+            with step_lock:
+                msg = current_step[0]
+            render_frame(f"  {Colors.CYAN}[{frame}]{Colors.RESET} {msg}")
+            frame_idx += 1
+            t.join(timeout=0.08)
+
+        res = outcome[0]
+        if res is not None:
+            ok, done_msg = res
+            badge = f"{Colors.GREEN}[OK]{Colors.RESET}" if ok else f"{Colors.RED}[!]{Colors.RESET}"
+            render_frame(f"  {badge} {done_msg}")
+            time.sleep(0.5)
+
+    # Clear screen ONCE at startup, hide cursor, and immediately render frame while scanning
     clear_screen()
     set_cursor_visible(False)
 
     try:
+        run_with_spinner(
+            "Initializing and scanning binaries...",
+            lambda cb: (state.refresh(progress_cb=cb), (True, "Status scan complete."))[1]
+        )
+
         while True:
-            # Build compact buffer (fits comfortably in 24-line console with zero scroll)
-            buf = [
-                "=" * 72,
-                f"               {Colors.BOLD}Antigravity Patcher & Proxy Manager v{__version__}{Colors.RESET}",
-                "=" * 72,
-                "",
-                f"  {Colors.BOLD}--- [ PROXY ENVIRONMENT VARIABLES ] ---{Colors.RESET}",
-            ]
-
-            # 0: AGY_U_PROXY
-            is_cur = (selected_idx == 0)
-            c_str = f"{Colors.CYAN}>{Colors.RESET} " if is_cur else "  "
-            ag_active = bool(state.ag_env)
-            badge = Colors.BADGE_ENABLED if ag_active else Colors.BADGE_DISABLED
-            t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
-            ag_detail = f"  {state.ag_env}" if ag_active else ""
-            buf.append(f"{c_str}{t_col}{ENV_VAR_AG:<23}{Colors.RESET}: {badge}{ag_detail}")
-
-            # 1: HTTPS_PROXY
-            is_cur = (selected_idx == 1)
-            c_str = f"{Colors.CYAN}>{Colors.RESET} " if is_cur else "  "
-            https_active = bool(state.https_env)
-            badge = Colors.BADGE_ENABLED if https_active else Colors.BADGE_DISABLED
-            t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
-            https_detail = f"  {state.https_env}" if https_active else ""
-            buf.append(f"{c_str}{t_col}{ENV_VAR_HTTPS:<23}{Colors.RESET}: {badge}{https_detail}")
-
-            buf.append("")
-            buf.append(f"  {Colors.BOLD}--- [ BINARY PATCHES ] ---{Colors.RESET}")
-
-            # Apps: 2 (Desktop), 3 (IDE), 4 (CLI)
-            for idx, cat in enumerate([AppCategory.DESKTOP, AppCategory.IDE, AppCategory.CLI], start=2):
-                is_cur = (selected_idx == idx)
-                c_str = f"{Colors.CYAN}>{Colors.RESET} " if is_cur else "  "
-                t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
-                app_info = state.apps.get(cat)
-                if not app_info or not app_info["target"]:
-                    buf.append(f"{c_str}{t_col}{cat:<23}{Colors.RESET}: {Colors.BADGE_NOT_FOUND}")
-                else:
-                    st = app_info["status"]
-                    b_badge = st["badge"] if st else Colors.BADGE_ERROR
-                    target_path = str(app_info["target"])
-                    buf.append(f"{c_str}{t_col}{cat:<23}{Colors.RESET}: {b_badge}  {Colors.GRAY}{target_path}{Colors.RESET}")
-
-            buf.append("")
-            buf.append(f"  {Colors.BOLD}--- [ ACTIONS ] ---{Colors.RESET}")
-            for idx in [5, 6, 7, 8]:
-                item = items[idx]
-                is_cur = (selected_idx == idx)
-                c_str = f"{Colors.CYAN}>{Colors.RESET} " if is_cur else "  "
-                t_col = f"{Colors.CYAN}{Colors.BOLD}" if is_cur else Colors.WHITE
-                buf.append(f"{c_str}{t_col}{item['title']}{Colors.RESET}")
-
-            buf.append("-" * 72)
-            buf.append("  [Up/Down] Navigate  |  [Space/Enter] Select  |  [Q] Exit")
-
-            # Reposition to top-left and write buffer (instant, zero flicker, zero I/O)
-            move_cursor_home()
-            out_str = "\n".join([line + "\033[K" for line in buf]) + "\n"
-            sys.stdout.write(out_str)
-            sys.stdout.flush()
+            render_frame()
 
             # Read key
             try:
@@ -954,41 +1116,53 @@ def run_interactive_tui(root_path: Optional[Path] = None):
 
                 if t == "proxy_ag":
                     if state.ag_env:
-                        # Toggle: currently enabled -> disable
-                        set_env_var(ENV_VAR_AG, None)
-                        state.refresh()
+                        def _disable_ag(cb: Callable[[str], None]) -> Tuple[bool, str]:
+                            ok = set_env_var(ENV_VAR_AG, None, progress_cb=cb)
+                            state.refresh(progress_cb=cb)
+                            return (ok, f"Disabled {ENV_VAR_AG}." if ok else f"Failed to disable {ENV_VAR_AG}.")
+                        run_with_spinner(f"Disabling {ENV_VAR_AG}...", _disable_ag)
                     else:
-                        # Toggle: currently disabled -> prompt for address and enable
                         set_cursor_visible(True)
                         print(f"\nEnter proxy address for {ENV_VAR_AG} [default: {state.ag_saved_url}]: ", end="", flush=True)
+                        target_url: Optional[str] = None
                         try:
                             val = input().strip()
                             target_url = val if val else state.ag_saved_url
-                            set_env_var(ENV_VAR_AG, target_url)
                         except Exception:
                             pass
-                        state.refresh()
                         set_cursor_visible(False)
                         clear_screen()
+                        if target_url:
+                            def _enable_ag(cb: Callable[[str], None]) -> Tuple[bool, str]:
+                                ok = set_env_var(ENV_VAR_AG, target_url, progress_cb=cb)
+                                state.refresh(progress_cb=cb)
+                                return (ok, f"Set {ENV_VAR_AG} = {target_url}" if ok else f"Failed to set {ENV_VAR_AG}.")
+                            run_with_spinner(f"Setting {ENV_VAR_AG}...", _enable_ag)
 
                 elif t == "proxy_https":
                     if state.https_env:
-                        # Toggle: currently enabled -> disable
-                        set_env_var(ENV_VAR_HTTPS, None)
-                        state.refresh()
+                        def _disable_https(cb: Callable[[str], None]) -> Tuple[bool, str]:
+                            ok = set_env_var(ENV_VAR_HTTPS, None, progress_cb=cb)
+                            state.refresh(progress_cb=cb)
+                            return (ok, f"Disabled {ENV_VAR_HTTPS}." if ok else f"Failed to disable {ENV_VAR_HTTPS}.")
+                        run_with_spinner(f"Disabling {ENV_VAR_HTTPS}...", _disable_https)
                     else:
-                        # Toggle: currently disabled -> prompt for address and enable
                         set_cursor_visible(True)
                         print(f"\nEnter proxy address for {ENV_VAR_HTTPS} [default: {state.https_saved_url}]: ", end="", flush=True)
+                        target_url_h: Optional[str] = None
                         try:
                             val = input().strip()
-                            target_url = val if val else state.https_saved_url
-                            set_env_var(ENV_VAR_HTTPS, target_url)
+                            target_url_h = val if val else state.https_saved_url
                         except Exception:
                             pass
-                        state.refresh()
                         set_cursor_visible(False)
                         clear_screen()
+                        if target_url_h:
+                            def _enable_https(cb: Callable[[str], None]) -> Tuple[bool, str]:
+                                ok = set_env_var(ENV_VAR_HTTPS, target_url_h, progress_cb=cb)
+                                state.refresh(progress_cb=cb)
+                                return (ok, f"Set {ENV_VAR_HTTPS} = {target_url_h}" if ok else f"Failed to set {ENV_VAR_HTTPS}.")
+                            run_with_spinner(f"Setting {ENV_VAR_HTTPS}...", _enable_https)
 
                 elif t == "app":
                     cat = curr["category"]
@@ -997,17 +1171,34 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                         target = app_data["target"]
                         st = app_data["status"]
                         target_unpatch = st["is_patched"] if st else False
-                        patch_file(target, unpatch=target_unpatch)
-                        state.refresh()
+                        verb = "Reverting" if target_unpatch else "Patching"
+
+                        def _toggle_app(cb: Callable[[str], None]) -> Tuple[bool, str]:
+                            res = patch_file(target, unpatch=target_unpatch, progress_cb=cb)
+                            cb(f"Verifying {target.name}...")
+                            state.refresh(progress_cb=cb)
+                            if res.error:
+                                return (False, f"{target.name}: {res.error}")
+                            done_verb = "Reverted" if target_unpatch else "Patched"
+                            return (True, f"{done_verb} {target.name} (reg:{res.region_replaced}, prx:{res.proxy_replaced})")
+
+                        run_with_spinner(f"{verb} {target.name}...", _toggle_app)
                     else:
                         # Prompt user for custom path if not found
                         set_cursor_visible(True)
                         print(f"\n{cat} binary not found automatically.")
                         print("Enter path to executable binary or directory (press Enter to cancel): ", end="", flush=True)
+                        custom_val = ""
                         try:
-                            val = input().strip()
-                            if val:
-                                p = Path(val.strip('\'"')).resolve()
+                            custom_val = input().strip()
+                        except Exception:
+                            pass
+                        set_cursor_visible(False)
+                        clear_screen()
+                        if custom_val:
+                            def _custom_patch(cb: Callable[[str], None]) -> Tuple[bool, str]:
+                                cb(f"Searching for binary in {custom_val}...")
+                                p = Path(custom_val.strip('\'"')).resolve()
                                 candidate: Optional[Path] = None
                                 if p.is_file() and p.exists():
                                     candidate = p
@@ -1016,36 +1207,65 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                                     if bins:
                                         matched = [b for b in bins if classify_binary(b) == cat]
                                         candidate = matched[0] if matched else bins[0]
-                                if candidate:
-                                    state.custom_paths[cat] = candidate
-                                    state.refresh()
-                                    app_data = state.apps.get(cat)
-                                    if app_data and app_data["target"]:
-                                        patch_file(app_data["target"], unpatch=False)
-                                else:
-                                    print(f"{Colors.RED}No valid binary found at specified path.{Colors.RESET}")
-                                    time.sleep(1.5)
-                        except Exception as e:
-                            print(f"{Colors.RED}Error: {e}{Colors.RESET}")
-                            time.sleep(1.5)
-                        state.refresh()
-                        set_cursor_visible(False)
-                        clear_screen()
+                                if not candidate:
+                                    return (False, "No valid binary found at specified path.")
+                                state.custom_paths[cat] = candidate
+                                res = patch_file(candidate, unpatch=False, progress_cb=cb)
+                                cb(f"Verifying {candidate.name}...")
+                                state.refresh(progress_cb=cb)
+                                if res.error:
+                                    return (False, f"{candidate.name}: {res.error}")
+                                return (True, f"Patched {candidate.name}")
+
+                            run_with_spinner("Locating custom binary...", _custom_patch)
 
                 elif t == "patch_all":
                     all_targets = [v["target"] for v in state.apps.values() if v and v["target"]]
-                    for target in all_targets:
-                        patch_file(target, unpatch=False)
-                    state.refresh()
+                    if not all_targets:
+                        run_with_spinner("Checking targets...", lambda cb: (False, "No detected binaries to patch."))
+                    else:
+                        def _patch_all(cb: Callable[[str], None]) -> Tuple[bool, str]:
+                            ok_count = 0
+                            for idx_t, target in enumerate(all_targets, 1):
+                                res = patch_file(
+                                    target,
+                                    unpatch=False,
+                                    progress_cb=lambda msg, i=idx_t, n=len(all_targets): cb(f"[{i}/{n}] {msg}")
+                                )
+                                if not res.error:
+                                    ok_count += 1
+                            cb("Verifying all binaries...")
+                            state.refresh(progress_cb=cb)
+                            return (ok_count == len(all_targets), f"Patched {ok_count}/{len(all_targets)} binaries.")
+
+                        run_with_spinner("Patching all detected applications...", _patch_all)
 
                 elif t == "revert_all":
                     all_targets = [v["target"] for v in state.apps.values() if v and v["target"]]
-                    for target in all_targets:
-                        patch_file(target, unpatch=True)
-                    state.refresh()
+                    if not all_targets:
+                        run_with_spinner("Checking targets...", lambda cb: (False, "No detected binaries to revert."))
+                    else:
+                        def _revert_all(cb: Callable[[str], None]) -> Tuple[bool, str]:
+                            ok_count = 0
+                            for idx_t, target in enumerate(all_targets, 1):
+                                res = patch_file(
+                                    target,
+                                    unpatch=True,
+                                    progress_cb=lambda msg, i=idx_t, n=len(all_targets): cb(f"[{i}/{n}] {msg}")
+                                )
+                                if not res.error:
+                                    ok_count += 1
+                            cb("Verifying all binaries...")
+                            state.refresh(progress_cb=cb)
+                            return (ok_count == len(all_targets), f"Reverted {ok_count}/{len(all_targets)} binaries.")
+
+                        run_with_spinner("Reverting all detected applications...", _revert_all)
 
                 elif t == "refresh":
-                    state.refresh()
+                    run_with_spinner(
+                        "Refreshing status...",
+                        lambda cb: (state.refresh(progress_cb=cb), (True, "Status refreshed."))[1]
+                    )
 
                 elif t == "exit":
                     break
@@ -1137,7 +1357,10 @@ def main():
         return
 
     if args.unset_proxy:
-        if set_env_var(ENV_VAR_AG, None):
+        sp = CliSpinner(f"Removing {ENV_VAR_AG}...").start()
+        ok = set_env_var(ENV_VAR_AG, None, progress_cb=sp.update)
+        sp.finish(f"Removed {ENV_VAR_AG}." if ok else f"Failed to remove {ENV_VAR_AG}.", ok=ok)
+        if ok:
             print(f"[+] Removed {ENV_VAR_AG} from environment.")
         else:
             print(f"[-] Failed to remove {ENV_VAR_AG}.")
@@ -1145,15 +1368,21 @@ def main():
 
     if args.set_proxy:
         url = args.proxy.strip()
-        if set_env_var(ENV_VAR_AG, url):
+        sp = CliSpinner(f"Setting {ENV_VAR_AG}...").start()
+        ok = set_env_var(ENV_VAR_AG, url, progress_cb=sp.update)
+        sp.finish(f"Set {ENV_VAR_AG}={url}" if ok else f"Failed to set {ENV_VAR_AG}.", ok=ok)
+        if ok:
             print(f"[+] Set {ENV_VAR_AG}={url}")
         else:
             print(f"[-] Failed to set {ENV_VAR_AG}.")
         return
 
+    sp_scan = CliSpinner("Scanning installation directories...").start()
     grouped = get_categorized_targets(root_path)
+    sp_scan.update("Reading proxy environment variables...")
     cur_ag = get_current_env_var(ENV_VAR_AG)
     cur_https = get_current_env_var(ENV_VAR_HTTPS)
+    sp_scan.finish()
 
     print("=" * 68)
     print(f"         Antigravity Patcher & Proxy Manager v{__version__}")
@@ -1168,7 +1397,9 @@ def main():
                 print(f"\n[-] {cat}: Not Installed")
             else:
                 for t in targets:
-                    st = get_binary_status(t)
+                    sp = CliSpinner(f"Inspecting {t.name}...").start()
+                    st = get_binary_status(t, progress_cb=sp.update)
+                    sp.finish(f"Inspected {t.name}", ok=(st.get("error") is None))
                     print(f"\n[*] {cat}: {st['badge']}")
                     print(f"    File:    {t}")
                     print(f"    Details: Region = {st['region']} | Proxy = {st['proxy']}")
@@ -1193,7 +1424,12 @@ def main():
     print(f"\n[*] {action_text} {args.target.upper()} ({len(selected_targets)} files)...")
 
     for t in selected_targets:
-        res = patch_file(t, unpatch=args.unpatch)
+        sp = CliSpinner(f"{action_text} {t.name}...").start()
+        res = patch_file(t, unpatch=args.unpatch, progress_cb=sp.update)
+        sp.finish(
+            f"{t.name}: {'Failed' if res.error else 'Done'}",
+            ok=(res.error is None)
+        )
         if res.error:
             print(f"  [-] {t.name}: Error ({res.error})")
         elif res.already_patched:
@@ -1204,7 +1440,10 @@ def main():
 
     if not args.no_env and not args.unpatch:
         url = args.proxy.strip()
-        if set_env_var(ENV_VAR_AG, url):
+        sp = CliSpinner(f"Setting {ENV_VAR_AG}...").start()
+        ok = set_env_var(ENV_VAR_AG, url, progress_cb=sp.update)
+        sp.finish(f"Configured {ENV_VAR_AG}" if ok else f"Failed to configure {ENV_VAR_AG}", ok=ok)
+        if ok:
             print(f"\n[+] Environment variable {ENV_VAR_AG} configured: {url}")
 
 
