@@ -1,0 +1,54 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'patcher.py'
+      - '.github/workflows/build-exe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-exe:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+
+      - name: Build antigravity-patcher.exe
+        run: |
+          pyinstaller --onefile --console --clean --name antigravity-patcher --distpath . patcher.py
+
+      - name: Verify executable
+        run: |
+          ./antigravity-patcher.exe --help
+
+      - name: Commit and push updated executable
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add antigravity-patcher.exe
+          if git diff --cached --quiet; then
+            echo "No changes to antigravity-patcher.exe"
+          else
+            git commit -m "chore(build): rebuild antigravity-patcher.exe from latest patcher.py [skip ci]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi

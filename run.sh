@@ -12,7 +12,7 @@ BRANCH="${AGY_BRANCH:-main}"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-URL="https://raw.githubusercontent.com/$REPO/$BRANCH/patcher.py"
+URL="https://raw.githubusercontent.com/$REPO/$BRANCH/patcher.py?cb=$(date +%s)"
 
 echo "Downloading Antigravity Patcher from $REPO..."
 curl -fsSL "$URL" -o "$TMP/patcher.py"
