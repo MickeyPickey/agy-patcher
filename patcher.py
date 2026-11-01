@@ -725,6 +725,8 @@ def detect_proxy_variable(data: bytes) -> Tuple[Optional[bytes], str]:
 def patch_file(
     path: Path,
     unpatch: bool = False,
+    patch_proxy: bool = False,
+    proxy_only: bool = False,
     progress_cb: Optional[Callable[[str], None]] = None
 ) -> PatchResult:
     """Perform in-place byte replacement on a binary file."""
@@ -744,26 +746,30 @@ def patch_file(
 
     new_data = data
 
-    # 1. Handle Region patch (ineligible <-> inexigible)
-    if unpatch:
-        reg_count = new_data.count(SIG_REGION_TO)
-        if reg_count > 0:
-            if progress_cb:
-                progress_cb(f"Reverting region signature in {path.name}...")
-            new_data = new_data.replace(SIG_REGION_TO, SIG_REGION_FROM)
-            res.region_replaced = reg_count
-    else:
-        reg_count = new_data.count(SIG_REGION_FROM)
-        if reg_count > 0:
-            if progress_cb:
-                progress_cb(f"Patching region signature in {path.name}...")
-            new_data = new_data.replace(SIG_REGION_FROM, SIG_REGION_TO)
-            res.region_replaced = reg_count
+    # 1. Handle Region patch (ineligible <-> inexigible) unless proxy_only
+    if not proxy_only:
+        if unpatch:
+            reg_count = new_data.count(SIG_REGION_TO)
+            if reg_count > 0:
+                if progress_cb:
+                    progress_cb(f"Reverting region signature in {path.name}...")
+                new_data = new_data.replace(SIG_REGION_TO, SIG_REGION_FROM)
+                res.region_replaced = reg_count
+        else:
+            reg_count = new_data.count(SIG_REGION_FROM)
+            if reg_count > 0:
+                if progress_cb:
+                    progress_cb(f"Patching region signature in {path.name}...")
+                new_data = new_data.replace(SIG_REGION_FROM, SIG_REGION_TO)
+                res.region_replaced = reg_count
 
     # 2. Handle Proxy patch
+    # Proxy signature is patched to AGY_U_PROXY only when not unpatching and AGY_U_PROXY is enabled.
+    # Otherwise, ensure proxy signature uses stock 'https_proxy'.
+    want_ag_proxy = (not unpatch) and patch_proxy
     proxy_sig, proxy_kind = detect_proxy_variable(new_data)
 
-    if unpatch:
+    if not want_ag_proxy:
         # Revert proxy back to stock 'https_proxy'
         if proxy_kind in ("ours", "foreign") and proxy_sig:
             prx_count = new_data.count(proxy_sig)
@@ -784,12 +790,18 @@ def patch_file(
 
     # Check if any modifications were made
     if res.region_replaced == 0 and res.proxy_replaced == 0:
-        if unpatch:
-            if SIG_REGION_FROM in data or SIG_PROXY_FROM in data:
+        if proxy_only:
+            expected_prx = SIG_PROXY_TO if want_ag_proxy else SIG_PROXY_FROM
+            if expected_prx in data:
+                res.already_patched = True
+                return res
+        elif unpatch:
+            if SIG_REGION_FROM in data and SIG_PROXY_FROM in data:
                 res.already_patched = True
                 return res
         else:
-            if SIG_REGION_TO in data and SIG_PROXY_TO in data:
+            expected_prx = SIG_PROXY_TO if want_ag_proxy else SIG_PROXY_FROM
+            if SIG_REGION_TO in data and expected_prx in data:
                 res.already_patched = True
                 return res
 
@@ -846,7 +858,11 @@ def patch_file(
     return res
 
 
-def get_binary_status(path: Path, progress_cb: Optional[Callable[[str], None]] = None) -> dict:
+def get_binary_status(
+    path: Path,
+    ag_enabled: bool = False,
+    progress_cb: Optional[Callable[[str], None]] = None
+) -> dict:
     """Read binary and return structured patch status."""
     try:
         if progress_cb:
@@ -863,14 +879,16 @@ def get_binary_status(path: Path, progress_cb: Optional[Callable[[str], None]] =
         has_prx_orig = (proxy_kind == "stock")
         has_prx_foreign = (proxy_kind == "foreign")
 
-        is_patched = has_reg_mod and has_prx_mod
+        expected_prx_ok = has_prx_mod if ag_enabled else has_prx_orig
+        is_patched = has_reg_mod and expected_prx_ok
         is_unpatched = has_reg_orig and has_prx_orig
         is_partial = not is_patched and not is_unpatched and (has_reg_mod or has_prx_mod or has_prx_foreign)
 
         reg_text = f"{Colors.GREEN}Unlocked{Colors.RESET}" if has_reg_mod else (f"{Colors.GRAY}Blocked{Colors.RESET}" if has_reg_orig else "Unknown")
 
         if has_prx_mod:
-            prx_text = f"{Colors.GREEN}{ENV_VAR_AG}{Colors.RESET}"
+            prx_col = Colors.GREEN if ag_enabled else Colors.YELLOW
+            prx_text = f"{prx_col}{ENV_VAR_AG}{Colors.RESET}"
         elif has_prx_orig:
             prx_text = f"{Colors.GRAY}https_proxy{Colors.RESET}"
         elif has_prx_foreign and proxy_sig:
@@ -891,6 +909,8 @@ def get_binary_status(path: Path, progress_cb: Optional[Callable[[str], None]] =
         return {
             "badge": badge,
             "is_patched": is_patched,
+            "has_reg_mod": has_reg_mod,
+            "has_prx_mod": has_prx_mod,
             "region": reg_text,
             "proxy": prx_text,
             "proxy_sig": proxy_sig.decode(errors="ignore") if proxy_sig else None,
@@ -901,6 +921,8 @@ def get_binary_status(path: Path, progress_cb: Optional[Callable[[str], None]] =
         return {
             "badge": Colors.BADGE_ERROR,
             "is_patched": False,
+            "has_reg_mod": False,
+            "has_prx_mod": False,
             "region": "Error",
             "proxy": "Error",
             "proxy_sig": None,
@@ -929,7 +951,7 @@ class AppState:
         if auto_refresh:
             self.refresh()
 
-    def refresh(self, progress_cb: Optional[Callable[[str], None]] = None):
+    def refresh(self, progress_cb: Optional[Callable[[str], None]] = None, sync_proxy: bool = True):
         """Perform disk scan and registry queries only when explicitly requested."""
         if progress_cb:
             progress_cb("Reading proxy environment variables...")
@@ -939,6 +961,8 @@ class AppState:
             self.ag_saved_url = self.ag_env
         if self.https_env:
             self.https_saved_url = self.https_env
+
+        ag_active = bool(self.ag_env)
 
         if progress_cb:
             progress_cb("Scanning installation directories for binaries...")
@@ -951,7 +975,17 @@ class AppState:
                     targets = [cp]
             if targets:
                 t = targets[0]
-                st = get_binary_status(t, progress_cb=progress_cb)
+                st = get_binary_status(t, ag_enabled=ag_active, progress_cb=progress_cb)
+                if sync_proxy and not st.get("error"):
+                    # Keep binary proxy signature synced with AGY_U_PROXY state:
+                    # - If AGY_U_PROXY is disabled, Prx must not remain patched to AGY_U_PROXY.
+                    # - If AGY_U_PROXY is enabled and binary is region-patched, apply Prx patch.
+                    if not ag_active and st.get("has_prx_mod"):
+                        patch_file(t, patch_proxy=False, proxy_only=True, progress_cb=progress_cb)
+                        st = get_binary_status(t, ag_enabled=ag_active, progress_cb=progress_cb)
+                    elif ag_active and st.get("has_reg_mod") and not st.get("has_prx_mod"):
+                        patch_file(t, patch_proxy=True, proxy_only=True, progress_cb=progress_cb)
+                        st = get_binary_status(t, ag_enabled=ag_active, progress_cb=progress_cb)
                 self.apps[cat] = {"target": t, "status": st, "scanning": False}
             else:
                 self.apps[cat] = {"target": None, "status": None, "scanning": False}
@@ -998,6 +1032,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
         t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
         ag_detail = f"  {state.ag_env}" if ag_active else ""
         buf.append(f"{c_str}{t_col}{ENV_VAR_AG:<23}{Colors.RESET}: {badge}{ag_detail}")
+        buf.append(f"    {Colors.GRAY}Proxies Language Server only (patches Prx, bypasses other apps){Colors.RESET}")
 
         # 1: HTTPS_PROXY
         is_cur = (selected_idx == 1)
@@ -1007,6 +1042,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
         t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
         https_detail = f"  {state.https_env}" if https_active else ""
         buf.append(f"{c_str}{t_col}{ENV_VAR_HTTPS:<23}{Colors.RESET}: {badge}{https_detail}")
+        buf.append(f"    {Colors.GRAY}Default global proxy variable (used directly by all applications){Colors.RESET}")
 
         buf.append("")
         buf.append(f"  {Colors.BOLD}--- [ BINARY PATCHES ] ---{Colors.RESET}")
@@ -1019,14 +1055,17 @@ def run_interactive_tui(root_path: Optional[Path] = None):
             app_info = state.apps.get(cat)
             if app_info and app_info.get("scanning"):
                 buf.append(f"{c_str}{t_col}{cat:<23}{Colors.RESET}: {Colors.BADGE_SCANNING}")
+                buf.append(f"    {Colors.GRAY}Scanning installation directories...{Colors.RESET}")
             elif not app_info or not app_info["target"]:
                 buf.append(f"{c_str}{t_col}{cat:<23}{Colors.RESET}: {Colors.BADGE_NOT_FOUND}")
+                buf.append(f"    {Colors.GRAY}Not found (press Space/Enter to specify custom path){Colors.RESET}")
             else:
                 st = app_info["status"]
                 b_badge = st["badge"] if st else Colors.BADGE_ERROR
                 sub_info = f"  Reg:{st['region']} {Colors.GRAY}|{Colors.RESET} Prx:{st['proxy']}" if st else ""
                 target_path = str(app_info["target"])
-                buf.append(f"{c_str}{t_col}{cat:<23}{Colors.RESET}: {b_badge}{sub_info}  {Colors.GRAY}{target_path}{Colors.RESET}")
+                buf.append(f"{c_str}{t_col}{cat:<23}{Colors.RESET}: {b_badge}{sub_info}")
+                buf.append(f"    {Colors.GRAY}{target_path}{Colors.RESET}")
 
         buf.append("")
         buf.append(f"  {Colors.BOLD}--- [ ACTIONS ] ---{Colors.RESET}")
@@ -1043,7 +1082,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
         buf.append("  [Up/Down] Navigate  |  [Space/Enter] Select  |  [Q] Exit")
 
         move_cursor_home()
-        out_str = "\n".join([line + "\033[K" for line in buf]) + "\n"
+        out_str = "\n".join([line + "\033[K" for line in buf]) + "\n\033[J"
         sys.stdout.write(out_str)
         sys.stdout.flush()
 
@@ -1119,7 +1158,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                         def _disable_ag(cb: Callable[[str], None]) -> Tuple[bool, str]:
                             ok = set_env_var(ENV_VAR_AG, None, progress_cb=cb)
                             state.refresh(progress_cb=cb)
-                            return (ok, f"Disabled {ENV_VAR_AG}." if ok else f"Failed to disable {ENV_VAR_AG}.")
+                            return (ok, f"Disabled {ENV_VAR_AG} and reverted Prx patch." if ok else f"Failed to disable {ENV_VAR_AG}.")
                         run_with_spinner(f"Disabling {ENV_VAR_AG}...", _disable_ag)
                     else:
                         set_cursor_visible(True)
@@ -1174,7 +1213,12 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                         verb = "Reverting" if target_unpatch else "Patching"
 
                         def _toggle_app(cb: Callable[[str], None]) -> Tuple[bool, str]:
-                            res = patch_file(target, unpatch=target_unpatch, progress_cb=cb)
+                            res = patch_file(
+                                target,
+                                unpatch=target_unpatch,
+                                patch_proxy=bool(state.ag_env),
+                                progress_cb=cb
+                            )
                             cb(f"Verifying {target.name}...")
                             state.refresh(progress_cb=cb)
                             if res.error:
@@ -1210,7 +1254,12 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                                 if not candidate:
                                     return (False, "No valid binary found at specified path.")
                                 state.custom_paths[cat] = candidate
-                                res = patch_file(candidate, unpatch=False, progress_cb=cb)
+                                res = patch_file(
+                                    candidate,
+                                    unpatch=False,
+                                    patch_proxy=bool(state.ag_env),
+                                    progress_cb=cb
+                                )
                                 cb(f"Verifying {candidate.name}...")
                                 state.refresh(progress_cb=cb)
                                 if res.error:
@@ -1230,6 +1279,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                                 res = patch_file(
                                     target,
                                     unpatch=False,
+                                    patch_proxy=bool(state.ag_env),
                                     progress_cb=lambda msg, i=idx_t, n=len(all_targets): cb(f"[{i}/{n}] {msg}")
                                 )
                                 if not res.error:
@@ -1251,6 +1301,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                                 res = patch_file(
                                     target,
                                     unpatch=True,
+                                    patch_proxy=False,
                                     progress_cb=lambda msg, i=idx_t, n=len(all_targets): cb(f"[{i}/{n}] {msg}")
                                 )
                                 if not res.error:
@@ -1302,8 +1353,8 @@ def main():
     parser.add_argument(
         "--proxy",
         "-p",
-        default=DEFAULT_PROXY_URL,
-        help=f"Proxy URL to configure (default: {DEFAULT_PROXY_URL})"
+        default=None,
+        help=f"Proxy URL to configure for {ENV_VAR_AG} (default when --set-proxy is used: {DEFAULT_PROXY_URL})"
     )
     parser.add_argument(
         "--set-proxy",
@@ -1359,17 +1410,27 @@ def main():
     if args.unset_proxy:
         sp = CliSpinner(f"Removing {ENV_VAR_AG}...").start()
         ok = set_env_var(ENV_VAR_AG, None, progress_cb=sp.update)
+        grouped = get_categorized_targets(root_path)
+        for t in [b for sub in grouped.values() for b in sub]:
+            st = get_binary_status(t, ag_enabled=False, progress_cb=sp.update)
+            if st.get("has_prx_mod"):
+                patch_file(t, patch_proxy=False, proxy_only=True, progress_cb=sp.update)
         sp.finish(f"Removed {ENV_VAR_AG}." if ok else f"Failed to remove {ENV_VAR_AG}.", ok=ok)
         if ok:
-            print(f"[+] Removed {ENV_VAR_AG} from environment.")
+            print(f"[+] Removed {ENV_VAR_AG} from environment and reverted Prx in binaries.")
         else:
             print(f"[-] Failed to remove {ENV_VAR_AG}.")
         return
 
     if args.set_proxy:
-        url = args.proxy.strip()
+        url = (args.proxy or DEFAULT_PROXY_URL).strip()
         sp = CliSpinner(f"Setting {ENV_VAR_AG}...").start()
         ok = set_env_var(ENV_VAR_AG, url, progress_cb=sp.update)
+        grouped = get_categorized_targets(root_path)
+        for t in [b for sub in grouped.values() for b in sub]:
+            st = get_binary_status(t, ag_enabled=True, progress_cb=sp.update)
+            if st.get("has_reg_mod") and not st.get("has_prx_mod"):
+                patch_file(t, patch_proxy=True, proxy_only=True, progress_cb=sp.update)
         sp.finish(f"Set {ENV_VAR_AG}={url}" if ok else f"Failed to set {ENV_VAR_AG}.", ok=ok)
         if ok:
             print(f"[+] Set {ENV_VAR_AG}={url}")
@@ -1384,11 +1445,22 @@ def main():
     cur_https = get_current_env_var(ENV_VAR_HTTPS)
     sp_scan.finish()
 
+    if args.proxy and not args.no_env and not args.unpatch:
+        url = args.proxy.strip()
+        sp = CliSpinner(f"Setting {ENV_VAR_AG}...").start()
+        if set_env_var(ENV_VAR_AG, url, progress_cb=sp.update):
+            cur_ag = url
+            sp.finish(f"Configured {ENV_VAR_AG}={url}", ok=True)
+        else:
+            sp.finish(f"Failed to configure {ENV_VAR_AG}", ok=False)
+
+    ag_active = bool(cur_ag)
+
     print("=" * 68)
     print(f"         Antigravity Patcher & Proxy Manager v{__version__}")
     print("=" * 68)
-    print(f"[*] {ENV_VAR_AG}:    {cur_ag or '<Not Set>'}")
-    print(f"[*] {ENV_VAR_HTTPS}: {cur_https or '<Not Set>'}")
+    print(f"[*] {ENV_VAR_AG}:    {cur_ag or '<Not Set>'}  (Proxies Language Server only when patched)")
+    print(f"[*] {ENV_VAR_HTTPS}: {cur_https or '<Not Set>'}  (Default global proxy variable)")
 
     if args.status:
         for cat in ALL_CATEGORIES:
@@ -1398,7 +1470,7 @@ def main():
             else:
                 for t in targets:
                     sp = CliSpinner(f"Inspecting {t.name}...").start()
-                    st = get_binary_status(t, progress_cb=sp.update)
+                    st = get_binary_status(t, ag_enabled=ag_active, progress_cb=sp.update)
                     sp.finish(f"Inspected {t.name}", ok=(st.get("error") is None))
                     print(f"\n[*] {cat}: {st['badge']}")
                     print(f"    File:    {t}")
@@ -1425,7 +1497,7 @@ def main():
 
     for t in selected_targets:
         sp = CliSpinner(f"{action_text} {t.name}...").start()
-        res = patch_file(t, unpatch=args.unpatch, progress_cb=sp.update)
+        res = patch_file(t, unpatch=args.unpatch, patch_proxy=ag_active, progress_cb=sp.update)
         sp.finish(
             f"{t.name}: {'Failed' if res.error else 'Done'}",
             ok=(res.error is None)
@@ -1433,18 +1505,10 @@ def main():
         if res.error:
             print(f"  [-] {t.name}: Error ({res.error})")
         elif res.already_patched:
-            state = "original" if args.unpatch else "patched"
-            print(f"  [=] {t.name}: Already in {state} state.")
+            state_str = "original" if args.unpatch else "patched"
+            print(f"  [=] {t.name}: Already in {state_str} state.")
         else:
             print(f"  [+] {t.name}: Success (region: {res.region_replaced}, proxy: {res.proxy_replaced})")
-
-    if not args.no_env and not args.unpatch:
-        url = args.proxy.strip()
-        sp = CliSpinner(f"Setting {ENV_VAR_AG}...").start()
-        ok = set_env_var(ENV_VAR_AG, url, progress_cb=sp.update)
-        sp.finish(f"Configured {ENV_VAR_AG}" if ok else f"Failed to configure {ENV_VAR_AG}", ok=ok)
-        if ok:
-            print(f"\n[+] Environment variable {ENV_VAR_AG} configured: {url}")
 
 
 if __name__ == "__main__":
