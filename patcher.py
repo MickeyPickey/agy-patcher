@@ -26,7 +26,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 
 # Byte signatures (Exact length match is mandatory)
 SIG_REGION_FROM = b"ineligible"   # 10 bytes
@@ -235,8 +235,65 @@ class CliSpinner:
 
 
 # ============================================================================
-# Keyboard Input Handler (Windows msvcrt / Linux termios)
+# Keyboard Input Handler (Windows Win32 Console API / msvcrt / Linux termios)
 # ============================================================================
+
+LAYOUT_HOTKEY_MAP: Dict[str, str] = {
+    # Cyrillic (Russian, Ukrainian, Belarusian, Bulgarian, Serbian)
+    "й": "QUIT", "Й": "QUIT",
+    "ц": "UP",   "Ц": "UP",
+    "ы": "DOWN", "Ы": "DOWN",
+    "і": "DOWN", "І": "DOWN",
+    "о": "DOWN", "О": "DOWN",
+    "л": "UP",   "Л": "UP",
+
+    # Greek
+    "θ": "QUIT", "Θ": "QUIT", ";": "QUIT",
+    "ς": "UP",   "Σ": "UP",
+    "σ": "DOWN",
+    "ξ": "DOWN", "Ξ": "DOWN",
+    "κ": "UP",   "Κ": "UP",
+
+    # Hebrew
+    "/": "QUIT",
+    "'": "UP",
+    "ד": "DOWN",
+    "ח": "DOWN",
+    "ל": "UP",
+
+    # Arabic
+    "ض": "QUIT",
+    "ص": "UP",
+    "س": "DOWN",
+    "ت": "DOWN",
+    "ن": "UP",
+}
+
+if is_windows():
+    from ctypes import wintypes
+
+    class KEY_EVENT_RECORD(ctypes.Structure):
+        _fields_ = [
+            ("bKeyDown", wintypes.BOOL),
+            ("wRepeatCount", wintypes.WORD),
+            ("wVirtualKeyCode", wintypes.WORD),
+            ("wVirtualScanCode", wintypes.WORD),
+            ("uChar", wintypes.WCHAR),
+            ("dwControlKeyState", wintypes.DWORD),
+        ]
+
+    class _INPUT_RECORD_UNION(ctypes.Union):
+        _fields_ = [
+            ("KeyEvent", KEY_EVENT_RECORD),
+            ("RawData", ctypes.c_byte * 16),
+        ]
+
+    class INPUT_RECORD(ctypes.Structure):
+        _fields_ = [
+            ("EventType", wintypes.WORD),
+            ("Event", _INPUT_RECORD_UNION),
+        ]
+
 
 def ensure_interactive_stdin() -> bool:
     """Ensure sys.stdin is connected to an interactive terminal (reopens /dev/tty if piped)."""
@@ -254,7 +311,17 @@ def ensure_interactive_stdin() -> bool:
 class KeyReader:
     def __init__(self):
         self.is_win = is_windows()
-        if not self.is_win:
+        self.h_conin = None
+        if self.is_win:
+            try:
+                kernel32 = ctypes.windll.kernel32
+                # Open CONIN$ to read raw input records directly even if stdin is redirected
+                h = kernel32.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+                if h != -1:
+                    self.h_conin = h
+            except Exception:
+                self.h_conin = None
+        else:
             import select
             import termios
             import tty
@@ -263,34 +330,115 @@ class KeyReader:
             self.tty = tty
             ensure_interactive_stdin()
 
+    def __del__(self):
+        if getattr(self, "h_conin", None) is not None and self.h_conin != -1:
+            try:
+                ctypes.windll.kernel32.CloseHandle(self.h_conin)
+            except Exception:
+                pass
+
+    def flush(self):
+        """Flush unread input events from console buffer before prompts."""
+        if self.is_win and getattr(self, "h_conin", None) is not None and self.h_conin != -1:
+            try:
+                ctypes.windll.kernel32.FlushConsoleInputBuffer(self.h_conin)
+            except Exception:
+                pass
+
     def read_key(self) -> str:
-        """Read a single key or key sequence (handles arrow keys)."""
+        """Read a single key or key sequence (handles arrow keys, layout independence)."""
         if self.is_win:
+            if self.h_conin is not None and self.h_conin != -1:
+                kernel32 = ctypes.windll.kernel32
+                record = INPUT_RECORD()
+                records_read = wintypes.DWORD()
+                # Standalone modifier keys to ignore on keydown
+                MODIFIER_VKS = {0x10, 0x11, 0x12, 0x14, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
+
+                while True:
+                    ok = kernel32.ReadConsoleInputW(
+                        self.h_conin,
+                        ctypes.byref(record),
+                        1,
+                        ctypes.byref(records_read),
+                    )
+                    if not ok or records_read.value == 0:
+                        break
+                    if record.EventType != 0x0001:  # KEY_EVENT only
+                        continue
+                    key_ev = record.Event.KeyEvent
+                    if not key_ev.bKeyDown:
+                        continue
+
+                    vk = key_ev.wVirtualKeyCode
+                    sc = key_ev.wVirtualScanCode
+                    char = key_ev.uChar
+                    ctrl = key_ev.dwControlKeyState
+
+                    # Ignore standalone modifier keys (Shift, Ctrl, Alt, CapsLock, Win)
+                    if vk in MODIFIER_VKS:
+                        continue
+
+                    # Ctrl+C
+                    if (ctrl & 0x000C) and (vk == 0x43 or char == "\x03"):
+                        raise KeyboardInterrupt
+
+                    # Quit: Esc (VK 0x1B, SC 0x01) or Q (VK 0x51, SC 0x10)
+                    if vk in (0x1B, 0x51) or sc in (0x01, 0x10):
+                        return "QUIT"
+
+                    # Up: Arrow Up (VK 0x26), W (VK 0x57, SC 0x11), K (VK 0x4B, SC 0x25)
+                    if vk in (0x26, 0x57, 0x4B) or sc in (0x11, 0x25):
+                        return "UP"
+
+                    # Down: Arrow Down (VK 0x28), S (VK 0x53, SC 0x1F), J (VK 0x4A, SC 0x24)
+                    if vk in (0x28, 0x53, 0x4A) or sc in (0x1F, 0x24):
+                        return "DOWN"
+
+                    # Left / Right
+                    if vk == 0x25:
+                        return "LEFT"
+                    if vk == 0x27:
+                        return "RIGHT"
+
+                    # Enter: VK 0x0D, SC 0x1C
+                    if vk == 0x0D or sc == 0x1C or char in ("\r", "\n"):
+                        return "ENTER"
+
+                    # Space: VK 0x20, SC 0x39
+                    if vk == 0x20 or sc == 0x39 or char == " ":
+                        return "SPACE"
+
+                    # Non-English layout character dictionary fallback
+                    if char in LAYOUT_HOTKEY_MAP:
+                        return LAYOUT_HOTKEY_MAP[char]
+
+                    if char:
+                        return char
+
+            # Fallback to msvcrt if CONIN$ reading fails (e.g. mintty / Git Bash)
             import msvcrt
-            ch = msvcrt.getch()
-            if ch in (b"\x00", b"\xe0"):
-                sub = msvcrt.getch()
-                if sub == b"H":
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):
+                sub = msvcrt.getwch()
+                if sub == "H":
                     return "UP"
-                elif sub == b"P":
+                elif sub == "P":
                     return "DOWN"
-                elif sub == b"K":
+                elif sub == "K":
                     return "LEFT"
-                elif sub == b"M":
+                elif sub == "M":
                     return "RIGHT"
                 return "SPECIAL"
-            elif ch == b"\r":
+            elif ch in ("\r", "\n"):
                 return "ENTER"
-            elif ch == b" ":
+            elif ch == " ":
                 return "SPACE"
-            elif ch in (b"\x1b", b"q", b"Q"):
+            elif ch in ("\x1b", "q", "Q"):
                 return "QUIT"
-            elif ch == b"\x03":
+            elif ch == "\x03":
                 raise KeyboardInterrupt
-            try:
-                return ch.decode("utf-8", errors="ignore")
-            except Exception:
-                return ""
+            return LAYOUT_HOTKEY_MAP.get(ch, ch)
         else:
             fd = sys.stdin.fileno()
             old_settings = self.termios.tcgetattr(fd)
@@ -299,6 +447,20 @@ class KeyReader:
                 b = os.read(fd, 1)
                 if not b:
                     return "QUIT"
+
+                # Multi-byte UTF-8 character decode support
+                b0 = b[0]
+                extra_bytes = 0
+                if (b0 & 0xE0) == 0xC0:
+                    extra_bytes = 1
+                elif (b0 & 0xF0) == 0xE0:
+                    extra_bytes = 2
+                elif (b0 & 0xF8) == 0xF0:
+                    extra_bytes = 3
+
+                if extra_bytes > 0:
+                    b += os.read(fd, extra_bytes)
+
                 ch = b.decode("utf-8", errors="ignore")
                 if ch == "\x1b":
                     # Non-blocking check on raw fd for arrow key escape sequence vs standalone ESC.
@@ -330,7 +492,7 @@ class KeyReader:
                     return "QUIT"
                 elif ch == "\x03":
                     raise KeyboardInterrupt
-                return ch
+                return LAYOUT_HOTKEY_MAP.get(ch, ch)
             finally:
                 self.termios.tcsetattr(fd, self.termios.TCSADRAIN, old_settings)
 
@@ -1213,7 +1375,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
         # Dedicated status/activity footer slot above keybind hints
         buf.append(activity_line)
         buf.append("-" * 70)
-        buf.append("  [Up/Down] Navigate  |  [Space/Enter] Select  |  [Q] Exit")
+        buf.append("  [Up/Down] Navigate  |  [Space/Enter] Select  |  [Esc / Q] Exit")
 
         move_cursor_home()
         out_str = "\n".join([line + "\033[K" for line in buf]) + "\n\033[J"
@@ -1294,6 +1456,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                             return (ok, f"Disabled {ENV_VAR_AG} and reverted Prx patch." if ok else f"Failed to disable {ENV_VAR_AG}.")
                         run_with_spinner(f"Disabling {ENV_VAR_AG}...", _disable_ag)
                     else:
+                        reader.flush()
                         set_cursor_visible(True)
                         print(f"\nEnter proxy address for {ENV_VAR_AG} [default: {state.ag_saved_url}]: ", end="", flush=True)
                         target_url: Optional[str] = None
@@ -1319,6 +1482,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                             return (ok, f"Disabled {ENV_VAR_HTTPS}." if ok else f"Failed to disable {ENV_VAR_HTTPS}.")
                         run_with_spinner(f"Disabling {ENV_VAR_HTTPS}...", _disable_https)
                     else:
+                        reader.flush()
                         set_cursor_visible(True)
                         print(f"\nEnter proxy address for {ENV_VAR_HTTPS} [default: {state.https_saved_url}]: ", end="", flush=True)
                         target_url_h: Optional[str] = None
@@ -1376,6 +1540,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                         run_with_spinner(f"{verb} {target.name}...", _toggle_app)
                     else:
                         # Prompt user for custom path if not found
+                        reader.flush()
                         set_cursor_visible(True)
                         print(f"\n{cat} binary not found automatically.")
                         print("Enter path to executable binary or directory (press Enter to cancel): ", end="", flush=True)

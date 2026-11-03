@@ -131,7 +131,7 @@ curl -fsSL https://raw.githubusercontent.com/MickeyPickey/agy-patcher/main/run.s
 
 * `[Up]` / `[Down]` - navigate
 * `[Space]` / `[Enter]` - toggle / apply
-* `[Q]` - quit
+* `[Esc]` / `[Q]` - quit (supports non-English layouts)
 
 ### Statuses
 
