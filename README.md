@@ -1,4 +1,4 @@
-# Antigravity Patcher v1.3.1
+# Antigravity Patcher v1.4.0
 
 [Русский](#русский) | [English](#english)
 
@@ -7,11 +7,19 @@
 <a name="русский"></a>
 ## Русский
 
-Автономный патчер Antigravity (Desktop, IDE, CLI). Снимает региональные ограничения, изолирует прокси через переменную `AGY_U_PROXY` и решает проблему истекшего внутреннего TLS-сертификата Language Server через `NODE_TLS_REJECT_UNAUTHORIZED`. Без фоновых служб и вотчдогов.
+Автономный патчер Antigravity (Desktop, IDE, CLI). Снимает региональные ограничения, изолирует прокси через переменную `AGY_U_PROXY`, поддерживает обновленную архитектуру Antigravity IDE (VS Code extension + Hub `~/.gemini/bin/agy.exe`) и решает проблему истекшего внутреннего TLS-сертификата Language Server через `NODE_TLS_REJECT_UNAUTHORIZED`. Без фоновых служб и вотчдогов.
 
 > [!NOTE]
 > **Важное примечание:**  
 > Патчер выполняет только разблокировку исполняемых файлов. Для работы Antigravity по-прежнему требуется либо настроенный прокси (заданный вручную в `AGY_U_PROXY` или `HTTPS_PROXY`), либо активный VPN.
+
+### Поддержка Antigravity IDE (обновление) и работа без TUN-режима
+
+1. **Новая структура Antigravity IDE**:  
+   В свежих версиях Antigravity IDE перешла на расширение `agy` (`google-antigravity`), которое автоматически загружает и запускает Language Server / Hub по пути `~/.gemini/bin/agy.exe` (`~/.gemini/bin/agy` на Linux). Патчер v1.4.0 автоматически находит и патчит этот бекенд, сохраняя точные метки времени `mtime` файла, чтобы не нарушать проверку целостности метаданных `agy.version.json`. Если указать путь к `Antigravity IDE.exe` или папке IDE, патчер корректно свяжет его с целевым бекендом.
+2. **Работа без TUN-режима (VPN)**:  
+   * Переменная `AGY_U_PROXY` изолированно направляет сетевые запросы пропатченных бинарников (`language_server.exe` и `agy.exe` Hub/CLI) через локальный прокси (например, `http://127.0.0.1:10808`).
+   * Для веб-оболочки Electron (`Antigravity.exe`), процесса входа в Google аккаунт и загрузки обновлений расширениями IDE без режима TUN предусмотрена настройка `HTTPS_PROXY` (и синхронизация с `HTTP_PROXY`). Ее можно включить в меню TUI (пункт `HTTPS_PROXY`) или через консоль `--set-https-proxy`.
 
 ### Обход истекшего локального TLS-сертификата
 
@@ -61,6 +69,10 @@ antigravity-patcher.exe --status              # Проверить статус
 antigravity-patcher.exe --patch               # Пропатчить все
 antigravity-patcher.exe --unpatch             # Откатить все
 antigravity-patcher.exe --proxy http://127.0.0.1:10808
+antigravity-patcher.exe --set-proxy           # Задать AGY_U_PROXY
+antigravity-patcher.exe --unset-proxy         # Удалить AGY_U_PROXY
+antigravity-patcher.exe --set-https-proxy     # Задать HTTPS_PROXY и HTTP_PROXY (для работы без TUN)
+antigravity-patcher.exe --unset-https-proxy   # Удалить HTTPS_PROXY и HTTP_PROXY
 antigravity-patcher.exe --set-tls-ignore      # Включить обход истекшего TLS-сертификата (NODE_TLS_REJECT_UNAUTHORIZED=0)
 antigravity-patcher.exe --unset-tls-ignore    # Отключить обход TLS-сертификата
 ```
@@ -73,11 +85,19 @@ antigravity-patcher.exe --unset-tls-ignore    # Отключить обход TL
 <a name="english"></a>
 ## English
 
-Standalone binary patcher for Antigravity (Desktop, IDE, CLI). Unlocks regional restrictions, isolates proxy routing via `AGY_U_PROXY`, and bypasses expired internal Language Server TLS certificates via `NODE_TLS_REJECT_UNAUTHORIZED`. No background daemons or watchdogs.
+Standalone binary patcher for Antigravity (Desktop, IDE, CLI). Unlocks regional restrictions, isolates proxy routing via `AGY_U_PROXY`, supports modernized Antigravity IDE architecture (VS Code extension + Hub `~/.gemini/bin/agy.exe`), and bypasses expired internal Language Server TLS certificates via `NODE_TLS_REJECT_UNAUTHORIZED`. No background daemons or watchdogs.
 
 > [!NOTE]
 > **Important Note:**  
 > This patcher only unlocks the executable binaries. For Antigravity to work properly, you still need either a configured proxy (specified manually via `AGY_U_PROXY` or `HTTPS_PROXY`) or an active VPN connection.
+
+### Antigravity IDE Update & Non-TUN Operation
+
+1. **Modern Antigravity IDE Architecture**:  
+   Recent Antigravity IDE versions use the `agy` (`google-antigravity`) extension which acquires and spawns the backend Language Server / Hub at `~/.gemini/bin/agy.exe` (`~/.gemini/bin/agy` on Linux). Patcher v1.4.0 automatically discovers and patches this backend while preserving exact file `mtime` to satisfy `agy.version.json` sidecar integrity checks. Passing `Antigravity IDE.exe` or the IDE installation directory automatically resolves to this backend.
+2. **Operation without TUN Mode (VPN)**:  
+   * `AGY_U_PROXY` isolates proxy routing exclusively to patched backend binaries (`language_server.exe` and `agy.exe` Hub/CLI).
+   * For the Electron UI (`Antigravity.exe`), Google OAuth sign-in, and IDE extension downloads without TUN mode, toggle `HTTPS_PROXY` (and synchronized `HTTP_PROXY`) in the TUI menu or via `--set-https-proxy`.
 
 ### Bypassing Expired Internal TLS Certificate
 
@@ -127,6 +147,10 @@ antigravity-patcher.exe --status              # Check status
 antigravity-patcher.exe --patch               # Patch all
 antigravity-patcher.exe --unpatch             # Revert all
 antigravity-patcher.exe --proxy http://127.0.0.1:10808
+antigravity-patcher.exe --set-proxy           # Set AGY_U_PROXY
+antigravity-patcher.exe --unset-proxy         # Remove AGY_U_PROXY
+antigravity-patcher.exe --set-https-proxy     # Set HTTPS_PROXY and HTTP_PROXY (for non-TUN operation)
+antigravity-patcher.exe --unset-https-proxy   # Remove HTTPS_PROXY and HTTP_PROXY
 antigravity-patcher.exe --set-tls-ignore      # Enable expired TLS cert bypass (NODE_TLS_REJECT_UNAUTHORIZED=0)
 antigravity-patcher.exe --unset-tls-ignore    # Disable TLS cert bypass
 ```

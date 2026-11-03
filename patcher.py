@@ -26,7 +26,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 # Byte signatures (Exact length match is mandatory)
 SIG_REGION_FROM = b"ineligible"   # 10 bytes
@@ -377,10 +377,15 @@ def set_env_var(name: str, value: Optional[str], progress_cb: Optional[Callable[
         action = "Removing" if value is None else "Setting"
         progress_cb(f"{action} {name} in user environment...")
 
-    if value is None:
-        os.environ.pop(name, None)
-    else:
-        os.environ[name] = value
+    target_vars = [name]
+    if name == ENV_VAR_HTTPS:
+        target_vars.append("HTTP_PROXY")
+
+    for v_name in target_vars:
+        if value is None:
+            os.environ.pop(v_name, None)
+        else:
+            os.environ[v_name] = value
 
     if is_windows():
         import winreg
@@ -389,13 +394,14 @@ def set_env_var(name: str, value: Optional[str], progress_cb: Optional[Callable[
         try:
             access = winreg.KEY_SET_VALUE if value is not None else (winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE)
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_path, 0, access) as key:
-                if value is None:
-                    try:
-                        winreg.DeleteValue(key, name)
-                    except FileNotFoundError:
-                        pass
-                else:
-                    winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+                for v_name in target_vars:
+                    if value is None:
+                        try:
+                            winreg.DeleteValue(key, v_name)
+                        except FileNotFoundError:
+                            pass
+                    else:
+                        winreg.SetValueEx(key, v_name, 0, winreg.REG_SZ, value)
 
             if progress_cb:
                 progress_cb(f"Broadcasting environment update ({name})...")
@@ -419,61 +425,67 @@ def set_env_var(name: str, value: Optional[str], progress_cb: Optional[Callable[
             if progress_cb:
                 progress_cb(f"Applying {name} via PowerShell fallback...")
             # Fallback to PowerShell
-            ps_cmd = (
-                f"[Environment]::SetEnvironmentVariable('{name}', $null, 'User')"
-                if value is None
-                else f"[Environment]::SetEnvironmentVariable('{name}', '{value}', 'User')"
-            )
-            res = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_cmd],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False
-            )
-            return res.returncode == 0
+            all_ok = True
+            for v_name in target_vars:
+                ps_cmd = (
+                    f"[Environment]::SetEnvironmentVariable('{v_name}', $null, 'User')"
+                    if value is None
+                    else f"[Environment]::SetEnvironmentVariable('{v_name}', '{value}', 'User')"
+                )
+                res = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps_cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False
+                )
+                if res.returncode != 0:
+                    all_ok = False
+            return all_ok
     else:
         # Linux: write drop-in to ~/.config/environment.d, hook shell rc, and apply via systemctl if available
         try:
             for home in _get_linux_home_dirs():
                 env_d = home / ".config" / "environment.d"
                 conf_file = env_d / "agy-patcher.conf"
-                if value is None:
-                    if conf_file.exists():
-                        lines = conf_file.read_text(encoding="utf-8").splitlines()
-                        new_lines = [l for l in lines if not l.startswith(f"{name}=")]
-                        if new_lines:
-                            conf_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-                        else:
-                            conf_file.unlink()
-                else:
-                    env_d.mkdir(parents=True, exist_ok=True)
-                    existing = ""
-                    if conf_file.exists():
-                        lines = [l for l in conf_file.read_text(encoding="utf-8").splitlines() if not l.startswith(f"{name}=")]
-                        existing = "\n".join(lines).strip()
-                    new_content = f"{name}={value}\n"
-                    if existing:
-                        new_content = existing + "\n" + new_content
-                    conf_file.write_text(new_content, encoding="utf-8")
-                    _ensure_shell_sources_env_conf(home)
+                for v_name in target_vars:
+                    if value is None:
+                        if conf_file.exists():
+                            lines = conf_file.read_text(encoding="utf-8").splitlines()
+                            new_lines = [l for l in lines if not l.startswith(f"{v_name}=")]
+                            if new_lines:
+                                conf_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+                            else:
+                                conf_file.unlink()
+                    else:
+                        env_d.mkdir(parents=True, exist_ok=True)
+                        existing = ""
+                        if conf_file.exists():
+                            lines = [l for l in conf_file.read_text(encoding="utf-8").splitlines() if not l.startswith(f"{v_name}=")]
+                            existing = "\n".join(lines).strip()
+                        new_content = f"{v_name}={value}\n"
+                        if existing:
+                            new_content = existing + "\n" + new_content
+                        conf_file.write_text(new_content, encoding="utf-8")
+                        _ensure_shell_sources_env_conf(home)
 
             if progress_cb:
                 progress_cb(f"Syncing {name} with systemd user environment...")
             try:
-                if value is None:
-                    subprocess.run(
-                        ["systemctl", "--user", "unset-environment", name],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False
-                    )
-                else:
-                    subprocess.run(
-                        ["systemctl", "--user", "set-environment", f"{name}={value}"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False
-                    )
+                for v_name in target_vars:
+                    if value is None:
+                        subprocess.run(
+                            ["systemctl", "--user", "unset-environment", v_name],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False
+                        )
+                    else:
+                        subprocess.run(
+                            ["systemctl", "--user", "set-environment", f"{v_name}={value}"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False
+                        )
             except FileNotFoundError:
                 pass
             return True
@@ -514,11 +526,69 @@ def classify_binary(path: Path) -> str:
     """Classify binary path into Desktop, IDE, or CLI."""
     path_str = str(path).lower()
     name = path.name.lower()
+    if ".gemini" in path_str or "antigravity ide" in path_str or "extensions" in path_str:
+        return AppCategory.IDE
     if name in ("agy.exe", "agy") or "\\agy\\" in path_str or "/agy/" in path_str:
         return AppCategory.CLI
-    if "antigravity ide" in path_str or "extensions" in path_str:
-        return AppCategory.IDE
     return AppCategory.DESKTOP
+
+
+def resolve_app_backend_binary(path: Path, category: Optional[str] = None) -> Path:
+    """
+    Given a file or directory path, resolve it to the actual patchable backend binary.
+    Handles Antigravity IDE (which executes ~/.gemini/bin/agy[.exe]), Antigravity Desktop,
+    and CLI wrappers.
+    """
+    if path.is_file() and _is_candidate_filename(path.name):
+        return path
+
+    lower_str = str(path).lower()
+    is_ide = (category == AppCategory.IDE) or ("ide" in lower_str) or ("extensions" in lower_str) or (".gemini" in lower_str)
+    is_desktop = (category == AppCategory.DESKTOP) or ("antigravity" in lower_str and not is_ide)
+
+    if is_ide:
+        candidate_roots = [path]
+        if path.is_file():
+            candidate_roots.append(path.parent)
+        for r in candidate_roots:
+            if not r.is_dir():
+                continue
+            for sd in [
+                r / "resources" / "app" / "extensions" / "agy" / "bin",
+                r / "resources" / "app" / "extensions" / "antigravity" / "bin",
+                r / "resources" / "bin",
+                r / "bin",
+            ]:
+                if sd.is_dir():
+                    for item in sd.iterdir():
+                        if item.is_file() and _is_candidate_filename(item.name):
+                            return item
+        # Modern Antigravity IDE uses ~/.gemini/bin/agy(.exe) as its Hub / Language Server backend
+        gemini_bin = Path.home() / ".gemini" / "bin" / ("agy.exe" if is_windows() else "agy")
+        if gemini_bin.is_file():
+            return gemini_bin
+
+    if is_desktop:
+        candidate_roots = [path]
+        if path.is_file():
+            candidate_roots.append(path.parent)
+        for r in candidate_roots:
+            if not r.is_dir():
+                continue
+            for sd in [r / "resources" / "bin", r / "bin"]:
+                if sd.is_dir():
+                    for item in sd.iterdir():
+                        if item.is_file() and _is_candidate_filename(item.name):
+                            return item
+
+    if path.is_dir():
+        for sd in [path / "bin", path]:
+            if sd.is_dir():
+                for item in sd.iterdir():
+                    if item.is_file() and _is_candidate_filename(item.name):
+                        return item
+
+    return path
 
 
 def get_candidate_install_dirs() -> List[Path]:
@@ -526,6 +596,12 @@ def get_candidate_install_dirs() -> List[Path]:
     candidates: List[Path] = []
 
     if is_windows():
+        user_home = Path.home()
+        candidates.extend([
+            user_home / ".gemini" / "bin",
+            user_home / ".gemini",
+        ])
+
         local_appdata = os.environ.get("LOCALAPPDATA", "")
         prog_files = os.environ.get("PROGRAMFILES", "")
         prog_files_x86 = os.environ.get("PROGRAMFILES(X86)", "")
@@ -574,10 +650,13 @@ def get_candidate_install_dirs() -> List[Path]:
 
         for home in homes:
             candidates.extend([
+                home / ".gemini" / "bin",
+                home / ".gemini",
                 home / ".local" / "share" / "Antigravity",
                 home / ".local" / "share" / "Antigravity IDE",
                 home / "Antigravity",
                 home / "Antigravity IDE",
+                home / ".antigravity-ide",
                 home / ".local" / "bin",
                 home / ".agy" / "bin",
                 home / ".agy",
@@ -606,7 +685,14 @@ def _is_candidate_binary(path: Path) -> bool:
 
 def find_target_binaries(root: Optional[Path] = None) -> List[Path]:
     """Find all language server and CLI binaries in given root or standard dirs."""
-    roots = [root] if root else get_candidate_install_dirs()
+    if root:
+        resolved = resolve_app_backend_binary(root)
+        if resolved.is_file() and _is_candidate_binary(resolved):
+            return [resolved.resolve()]
+        roots = [root]
+    else:
+        roots = get_candidate_install_dirs()
+
     targets: Set[Path] = set()
 
     for r in roots:
@@ -618,6 +704,7 @@ def find_target_binaries(root: Optional[Path] = None) -> List[Path]:
         search_dirs = [
             r,
             r / "resources" / "bin",
+            r / "resources" / "app" / "extensions" / "agy" / "bin",
             r / "resources" / "app" / "extensions" / "antigravity" / "bin",
             r / "bin",
         ]
@@ -650,6 +737,13 @@ def get_categorized_targets(root: Optional[Path] = None) -> Dict[str, List[Path]
     for t in raw_targets:
         cat = classify_binary(t)
         grouped[cat].append(t)
+
+    # Ensure modern Antigravity IDE backend (~/.gemini/bin/agy[.exe]) is populated if present
+    if not root and not grouped[AppCategory.IDE]:
+        ide_backend = Path.home() / ".gemini" / "bin" / ("agy.exe" if is_windows() else "agy")
+        if ide_backend.is_file() and _is_candidate_binary(ide_backend):
+            grouped[AppCategory.IDE].append(ide_backend.resolve())
+
     return grouped
 
 
@@ -736,7 +830,8 @@ def patch_file(
     res = PatchResult(path)
 
     try:
-        sz_str = _format_size(path.stat().st_size)
+        orig_stat = path.stat()
+        sz_str = _format_size(orig_stat.st_size)
         if progress_cb:
             progress_cb(f"Reading {path.name} ({sz_str})...")
         data = path.read_bytes()
@@ -853,6 +948,11 @@ def patch_file(
                     old_path.unlink(missing_ok=True)
                 except Exception:
                     pass
+
+        try:
+            os.utime(path, (orig_stat.st_atime, orig_stat.st_mtime))
+        except Exception:
+            pass
     except Exception as e:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
@@ -1046,7 +1146,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
         ag_detail = f"  {state.ag_env}" if ag_active else ""
         buf.append(f"{c_str}{t_col}{ENV_VAR_AG:<29}{Colors.RESET}: {badge}{ag_detail}")
         if is_cur or not compact:
-            buf.append(f"    {Colors.GRAY}Custom proxy env for language_server only (replaces default https_proxy){Colors.RESET}")
+            buf.append(f"    {Colors.GRAY}Isolated proxy env for patched backend binaries (language_server / agy hub){Colors.RESET}")
 
         # 1: HTTPS_PROXY
         is_cur = (selected_idx == 1)
@@ -1057,7 +1157,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
         https_detail = f"  {state.https_env}" if https_active else ""
         buf.append(f"{c_str}{t_col}{ENV_VAR_HTTPS:<29}{Colors.RESET}: {badge}{https_detail}")
         if is_cur or not compact:
-            buf.append(f"    {Colors.GRAY}Default global proxy env used by all apps{Colors.RESET}")
+            buf.append(f"    {Colors.GRAY}Global proxy env for Electron UI, extensions, downloads (needed without TUN){Colors.RESET}")
 
         # 2: NODE_TLS_REJECT_UNAUTHORIZED
         is_cur = (selected_idx == 2)
@@ -1093,6 +1193,8 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                 b_badge = st["badge"] if st else Colors.BADGE_ERROR
                 sub_info = f"  Region: {st['region']} {Colors.GRAY}|{Colors.RESET} Custom proxy: {st['proxy']}" if st else ""
                 target_path = str(app_info["target"])
+                if cat == AppCategory.IDE and app_info["target"].name.lower() in ("agy.exe", "agy"):
+                    target_path = f"{target_path} (Backend Hub)"
                 buf.append(f"{c_str}{t_col}{cat:<29}{Colors.RESET}: {b_badge}{sub_info}")
                 if is_cur or not compact:
                     buf.append(f"    {Colors.GRAY}{target_path}{Colors.RESET}")
@@ -1288,8 +1390,9 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                                 cb(f"Searching for binary in {custom_val}...")
                                 p = Path(custom_val.strip('\'"')).resolve()
                                 candidate: Optional[Path] = None
-                                if p.is_file() and p.exists():
-                                    candidate = p
+                                resolved = resolve_app_backend_binary(p, cat)
+                                if resolved.is_file() and _is_candidate_binary(resolved):
+                                    candidate = resolved
                                 elif p.is_dir() and p.exists():
                                     bins = find_target_binaries(p)
                                     if bins:
@@ -1410,6 +1513,16 @@ def main():
         help="Remove AGY_U_PROXY variable from OS environment and exit"
     )
     parser.add_argument(
+        "--set-https-proxy",
+        action="store_true",
+        help=f"Set {ENV_VAR_HTTPS} (and HTTP_PROXY) variable to OS environment and exit"
+    )
+    parser.add_argument(
+        "--unset-https-proxy",
+        action="store_true",
+        help=f"Remove {ENV_VAR_HTTPS} (and HTTP_PROXY) variable from OS environment and exit"
+    )
+    parser.add_argument(
         "--set-tls-ignore",
         action="store_true",
         help=f"Set {ENV_VAR_NODE_TLS}=0 to bypass expired local TLS certificate and exit"
@@ -1458,6 +1571,27 @@ def main():
 
     if args.tui:
         run_interactive_tui(root_path)
+        return
+
+    if args.unset_https_proxy:
+        sp = CliSpinner(f"Removing {ENV_VAR_HTTPS}...").start()
+        ok = set_env_var(ENV_VAR_HTTPS, None, progress_cb=sp.update)
+        sp.finish(f"Removed {ENV_VAR_HTTPS}." if ok else f"Failed to remove {ENV_VAR_HTTPS}.", ok=ok)
+        if ok:
+            print(f"[+] Removed {ENV_VAR_HTTPS} (and HTTP_PROXY) from environment.")
+        else:
+            print(f"[-] Failed to remove {ENV_VAR_HTTPS}.")
+        return
+
+    if args.set_https_proxy:
+        url = (args.proxy or DEFAULT_PROXY_URL).strip()
+        sp = CliSpinner(f"Setting {ENV_VAR_HTTPS}...").start()
+        ok = set_env_var(ENV_VAR_HTTPS, url, progress_cb=sp.update)
+        sp.finish(f"Set {ENV_VAR_HTTPS}={url}" if ok else f"Failed to set {ENV_VAR_HTTPS}.", ok=ok)
+        if ok:
+            print(f"[+] Set {ENV_VAR_HTTPS}={url} (and HTTP_PROXY={url}).")
+        else:
+            print(f"[-] Failed to set {ENV_VAR_HTTPS}.")
         return
 
     if args.unset_tls_ignore:
