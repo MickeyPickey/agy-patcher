@@ -4,5 +4,7 @@ __pycache__/
 *.spec
 build/
 dist/
+*.exe
+antigravity-patcher.exe
 .DS_Store
 Thumbs.db

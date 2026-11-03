@@ -37,10 +37,15 @@
         return
     }
 
-    $url = "https://raw.githubusercontent.com/$Repo/$Branch/antigravity-patcher.exe?cb=$CacheBust"
+    $tag = if ($env:AGY_VERSION) { $env:AGY_VERSION } else { "latest" }
+    $url = if ($tag -eq "latest") {
+        "https://github.com/$Repo/releases/latest/download/antigravity-patcher.exe"
+    } else {
+        "https://github.com/$Repo/releases/download/$tag/antigravity-patcher.exe"
+    }
     $dest = Join-Path $env:TEMP "antigravity-patcher.exe"
 
-    Write-Host "Downloading Antigravity Patcher (antigravity-patcher.exe) from $Repo..." -ForegroundColor Cyan
+    Write-Host "Downloading Antigravity Patcher (antigravity-patcher.exe) from $Repo ($tag)..." -ForegroundColor Cyan
     try {
         Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -Headers @{"Cache-Control"="no-cache"}
     } catch {
