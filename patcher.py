@@ -884,18 +884,22 @@ def get_binary_status(
         is_unpatched = has_reg_orig and has_prx_orig
         is_partial = not is_patched and not is_unpatched and (has_reg_mod or has_prx_mod or has_prx_foreign)
 
-        reg_text = f"{Colors.GREEN}Unlocked{Colors.RESET}" if has_reg_mod else (f"{Colors.GRAY}Blocked{Colors.RESET}" if has_reg_orig else "Unknown")
+        reg_text = (
+            f"{Colors.GREEN}[Unlocked]{Colors.RESET}"
+            if has_reg_mod
+            else (f"{Colors.GRAY}[Blocked]{Colors.RESET}" if has_reg_orig else f"{Colors.YELLOW}[Unknown]{Colors.RESET}")
+        )
 
         if has_prx_mod:
             prx_col = Colors.GREEN if ag_enabled else Colors.YELLOW
-            prx_text = f"{prx_col}{ENV_VAR_AG}{Colors.RESET}"
+            prx_text = f"{prx_col}[Enabled]{Colors.RESET} ({prx_col}{ENV_VAR_AG}{Colors.RESET})"
         elif has_prx_orig:
-            prx_text = f"{Colors.GRAY}https_proxy{Colors.RESET}"
+            prx_text = f"{Colors.GRAY}[Disabled]{Colors.RESET}"
         elif has_prx_foreign and proxy_sig:
             sig_name = proxy_sig.decode(errors="ignore")
-            prx_text = f"{Colors.YELLOW}{sig_name} (foreign){Colors.RESET}"
+            prx_text = f"{Colors.YELLOW}[Enabled]{Colors.RESET} ({Colors.YELLOW}{sig_name}{Colors.RESET})"
         else:
-            prx_text = "Unknown"
+            prx_text = f"{Colors.YELLOW}[Unknown]{Colors.RESET}"
 
         if is_patched:
             badge = Colors.BADGE_ENABLED
@@ -1032,7 +1036,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
         t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
         ag_detail = f"  {state.ag_env}" if ag_active else ""
         buf.append(f"{c_str}{t_col}{ENV_VAR_AG:<23}{Colors.RESET}: {badge}{ag_detail}")
-        buf.append(f"    {Colors.GRAY}Proxies Language Server only (patches Prx, bypasses other apps){Colors.RESET}")
+        buf.append(f"    {Colors.GRAY}Custom proxy env for language_server only (replaces default https_proxy){Colors.RESET}")
 
         # 1: HTTPS_PROXY
         is_cur = (selected_idx == 1)
@@ -1042,7 +1046,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
         t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
         https_detail = f"  {state.https_env}" if https_active else ""
         buf.append(f"{c_str}{t_col}{ENV_VAR_HTTPS:<23}{Colors.RESET}: {badge}{https_detail}")
-        buf.append(f"    {Colors.GRAY}Default global proxy variable (used directly by all applications){Colors.RESET}")
+        buf.append(f"    {Colors.GRAY}Default global proxy env used by all apps{Colors.RESET}")
 
         buf.append("")
         buf.append(f"  {Colors.BOLD}--- [ BINARY PATCHES ] ---{Colors.RESET}")
@@ -1062,7 +1066,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
             else:
                 st = app_info["status"]
                 b_badge = st["badge"] if st else Colors.BADGE_ERROR
-                sub_info = f"  Reg:{st['region']} {Colors.GRAY}|{Colors.RESET} Prx:{st['proxy']}" if st else ""
+                sub_info = f"  Region: {st['region']} {Colors.GRAY}|{Colors.RESET} Custom proxy: {st['proxy']}" if st else ""
                 target_path = str(app_info["target"])
                 buf.append(f"{c_str}{t_col}{cat:<23}{Colors.RESET}: {b_badge}{sub_info}")
                 buf.append(f"    {Colors.GRAY}{target_path}{Colors.RESET}")
@@ -1459,8 +1463,8 @@ def main():
     print("=" * 68)
     print(f"         Antigravity Patcher & Proxy Manager v{__version__}")
     print("=" * 68)
-    print(f"[*] {ENV_VAR_AG}:    {cur_ag or '<Not Set>'}  (Proxies Language Server only when patched)")
-    print(f"[*] {ENV_VAR_HTTPS}: {cur_https or '<Not Set>'}  (Default global proxy variable)")
+    print(f"[*] {ENV_VAR_AG}:    {cur_ag or '<Not Set>'}  (Custom proxy env for language_server only, replaces default https_proxy)")
+    print(f"[*] {ENV_VAR_HTTPS}: {cur_https or '<Not Set>'}  (Default global proxy env used by all apps)")
 
     if args.status:
         for cat in ALL_CATEGORIES:
@@ -1474,7 +1478,7 @@ def main():
                     sp.finish(f"Inspected {t.name}", ok=(st.get("error") is None))
                     print(f"\n[*] {cat}: {st['badge']}")
                     print(f"    File:    {t}")
-                    print(f"    Details: Region = {st['region']} | Proxy = {st['proxy']}")
+                    print(f"    Details: Region: {st['region']} | Custom proxy: {st['proxy']}")
         return
 
     # Process CLI target
