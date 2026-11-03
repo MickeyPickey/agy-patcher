@@ -14,6 +14,7 @@ import os
 import platform
 import re
 import subprocess
+import shutil
 import sys
 import threading
 import time
@@ -25,7 +26,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 # Byte signatures (Exact length match is mandatory)
 SIG_REGION_FROM = b"ineligible"   # 10 bytes
@@ -125,26 +126,27 @@ def set_cursor_visible(visible: bool):
 
 
 def move_cursor_home():
-    """Move cursor to top-left (0,0) without clearing screen buffer (no flicker)."""
-    if is_windows():
-        try:
-            kernel32 = ctypes.windll.kernel32
-            h = kernel32.GetStdHandle(-11)
-            if kernel32.SetConsoleCursorPosition(h, COORD(0, 0)):
-                return
-        except Exception:
-            pass
+    """Move cursor to top-left (1,1) of visible viewport."""
     sys.stdout.write("\033[H")
     sys.stdout.flush()
 
 
 def clear_screen():
-    """Clear terminal screen once (at startup or after text input)."""
-    if is_windows():
-        os.system("cls")
-    else:
-        sys.stdout.write("\033[H\033[2J\033[3J")
-        sys.stdout.flush()
+    """Clear terminal viewport and move cursor home."""
+    sys.stdout.write("\033[H\033[2J")
+    sys.stdout.flush()
+
+
+def enter_alternate_screen():
+    """Switch to alternate terminal screen buffer and hide cursor."""
+    sys.stdout.write("\033[?1049h\033[H\033[2J\033[?25l")
+    sys.stdout.flush()
+
+
+def leave_alternate_screen():
+    """Restore main terminal screen buffer and show cursor."""
+    sys.stdout.write("\033[?1049l\033[?25h")
+    sys.stdout.flush()
 
 
 enable_virtual_terminal()
@@ -1024,13 +1026,16 @@ def run_interactive_tui(root_path: Optional[Path] = None):
 
     def render_frame(activity_line: str = "") -> None:
         """Render the TUI frame at top-left (0,0) with an optional activity footer line."""
-        buf = [
-            "=" * 72,
-            f"               {Colors.BOLD}Antigravity Patcher & Proxy Manager v{__version__}{Colors.RESET}",
-            "=" * 72,
-            "",
-            f"  {Colors.BOLD}--- [ ENVIRONMENT VARIABLES ] ---{Colors.RESET}",
-        ]
+        term_height = shutil.get_terminal_size(fallback=(80, 24)).lines
+        compact = term_height < 32
+
+        sep = "=" * 70
+        title = f"             {Colors.BOLD}Antigravity Patcher & Proxy Manager v{__version__}{Colors.RESET}"
+        buf = [sep, title, sep]
+
+        if not compact:
+            buf.append("")
+        buf.append(f"  {Colors.BOLD}--- [ ENVIRONMENT VARIABLES ] ---{Colors.RESET}")
 
         # 0: AGY_U_PROXY
         is_cur = (selected_idx == 0)
@@ -1040,7 +1045,8 @@ def run_interactive_tui(root_path: Optional[Path] = None):
         t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
         ag_detail = f"  {state.ag_env}" if ag_active else ""
         buf.append(f"{c_str}{t_col}{ENV_VAR_AG:<29}{Colors.RESET}: {badge}{ag_detail}")
-        buf.append(f"    {Colors.GRAY}Custom proxy env for language_server only (replaces default https_proxy){Colors.RESET}")
+        if is_cur or not compact:
+            buf.append(f"    {Colors.GRAY}Custom proxy env for language_server only (replaces default https_proxy){Colors.RESET}")
 
         # 1: HTTPS_PROXY
         is_cur = (selected_idx == 1)
@@ -1050,7 +1056,8 @@ def run_interactive_tui(root_path: Optional[Path] = None):
         t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
         https_detail = f"  {state.https_env}" if https_active else ""
         buf.append(f"{c_str}{t_col}{ENV_VAR_HTTPS:<29}{Colors.RESET}: {badge}{https_detail}")
-        buf.append(f"    {Colors.GRAY}Default global proxy env used by all apps{Colors.RESET}")
+        if is_cur or not compact:
+            buf.append(f"    {Colors.GRAY}Default global proxy env used by all apps{Colors.RESET}")
 
         # 2: NODE_TLS_REJECT_UNAUTHORIZED
         is_cur = (selected_idx == 2)
@@ -1060,9 +1067,11 @@ def run_interactive_tui(root_path: Optional[Path] = None):
         t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
         tls_detail = f"  (value: {state.node_tls_env})" if state.node_tls_env is not None else ""
         buf.append(f"{c_str}{t_col}{ENV_VAR_NODE_TLS:<29}{Colors.RESET}: {badge}{tls_detail}")
-        buf.append(f"    {Colors.GRAY}Bypass expired internal TLS cert for 127.0.0.1 LS (applies to all Node apps){Colors.RESET}")
+        if is_cur or not compact:
+            buf.append(f"    {Colors.GRAY}Bypass expired internal TLS cert for 127.0.0.1 LS (applies to all Node apps){Colors.RESET}")
 
-        buf.append("")
+        if not compact:
+            buf.append("")
         buf.append(f"  {Colors.BOLD}--- [ BINARY PATCHES ] ---{Colors.RESET}")
 
         # Apps: 3 (Desktop), 4 (IDE), 5 (CLI)
@@ -1073,19 +1082,23 @@ def run_interactive_tui(root_path: Optional[Path] = None):
             app_info = state.apps.get(cat)
             if app_info and app_info.get("scanning"):
                 buf.append(f"{c_str}{t_col}{cat:<29}{Colors.RESET}: {Colors.BADGE_SCANNING}")
-                buf.append(f"    {Colors.GRAY}Scanning installation directories...{Colors.RESET}")
+                if is_cur or not compact:
+                    buf.append(f"    {Colors.GRAY}Scanning installation directories...{Colors.RESET}")
             elif not app_info or not app_info["target"]:
                 buf.append(f"{c_str}{t_col}{cat:<29}{Colors.RESET}: {Colors.BADGE_NOT_FOUND}")
-                buf.append(f"    {Colors.GRAY}Not found (press Space/Enter to specify custom path){Colors.RESET}")
+                if is_cur or not compact:
+                    buf.append(f"    {Colors.GRAY}Not found (press Space/Enter to specify custom path){Colors.RESET}")
             else:
                 st = app_info["status"]
                 b_badge = st["badge"] if st else Colors.BADGE_ERROR
                 sub_info = f"  Region: {st['region']} {Colors.GRAY}|{Colors.RESET} Custom proxy: {st['proxy']}" if st else ""
                 target_path = str(app_info["target"])
                 buf.append(f"{c_str}{t_col}{cat:<29}{Colors.RESET}: {b_badge}{sub_info}")
-                buf.append(f"    {Colors.GRAY}{target_path}{Colors.RESET}")
+                if is_cur or not compact:
+                    buf.append(f"    {Colors.GRAY}{target_path}{Colors.RESET}")
 
-        buf.append("")
+        if not compact:
+            buf.append("")
         buf.append(f"  {Colors.BOLD}--- [ ACTIONS ] ---{Colors.RESET}")
         for idx in [6, 7, 8, 9]:
             item = items[idx]
@@ -1096,7 +1109,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
 
         # Dedicated status/activity footer slot above keybind hints
         buf.append(activity_line)
-        buf.append("-" * 72)
+        buf.append("-" * 70)
         buf.append("  [Up/Down] Navigate  |  [Space/Enter] Select  |  [Q] Exit")
 
         move_cursor_home()
@@ -1133,18 +1146,17 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                 msg = current_step[0]
             render_frame(f"  {Colors.CYAN}[{frame}]{Colors.RESET} {msg}")
             frame_idx += 1
-            t.join(timeout=0.08)
+            t.join(timeout=0.12)
 
         res = outcome[0]
         if res is not None:
             ok, done_msg = res
             badge = f"{Colors.GREEN}[OK]{Colors.RESET}" if ok else f"{Colors.RED}[!]{Colors.RESET}"
             render_frame(f"  {badge} {done_msg}")
-            time.sleep(0.5)
+            time.sleep(0.4)
 
-    # Clear screen ONCE at startup, hide cursor, and immediately render frame while scanning
-    clear_screen()
-    set_cursor_visible(False)
+    # Switch to alternate screen buffer and immediately render frame while scanning
+    enter_alternate_screen()
 
     try:
         run_with_spinner(
@@ -1353,8 +1365,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                 elif t == "exit":
                     break
     finally:
-        set_cursor_visible(True)
-        print("\nExiting.")
+        leave_alternate_screen()
 
 
 # ============================================================================
