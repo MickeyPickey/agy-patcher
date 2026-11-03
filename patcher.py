@@ -25,7 +25,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # Byte signatures (Exact length match is mandatory)
 SIG_REGION_FROM = b"ineligible"   # 10 bytes
@@ -42,6 +42,7 @@ KNOWN_ALT_PROXIES = [
 DEFAULT_PROXY_URL = "http://127.0.0.1:10808"
 ENV_VAR_AG = "AGY_U_PROXY"
 ENV_VAR_HTTPS = "HTTPS_PROXY"
+ENV_VAR_NODE_TLS = "NODE_TLS_REJECT_UNAUTHORIZED"
 
 LOCKED_PROCESSES_WIN = [
     "language_server.exe",
@@ -945,6 +946,7 @@ class AppState:
         self.root_path = root_path
         self.ag_env = None
         self.https_env = None
+        self.node_tls_env = None
         self.ag_saved_url = DEFAULT_PROXY_URL
         self.https_saved_url = DEFAULT_PROXY_URL
         self.apps: Dict[str, dict] = {
@@ -958,9 +960,10 @@ class AppState:
     def refresh(self, progress_cb: Optional[Callable[[str], None]] = None, sync_proxy: bool = True):
         """Perform disk scan and registry queries only when explicitly requested."""
         if progress_cb:
-            progress_cb("Reading proxy environment variables...")
+            progress_cb("Reading environment variables...")
         self.ag_env = get_current_env_var(ENV_VAR_AG)
         self.https_env = get_current_env_var(ENV_VAR_HTTPS)
+        self.node_tls_env = get_current_env_var(ENV_VAR_NODE_TLS)
         if self.ag_env:
             self.ag_saved_url = self.ag_env
         if self.https_env:
@@ -1007,6 +1010,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
     items = [
         {"type": "proxy_ag", "name": ENV_VAR_AG},
         {"type": "proxy_https", "name": ENV_VAR_HTTPS},
+        {"type": "node_tls", "name": ENV_VAR_NODE_TLS},
         {"type": "app", "category": AppCategory.DESKTOP},
         {"type": "app", "category": AppCategory.IDE},
         {"type": "app", "category": AppCategory.CLI},
@@ -1025,7 +1029,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
             f"               {Colors.BOLD}Antigravity Patcher & Proxy Manager v{__version__}{Colors.RESET}",
             "=" * 72,
             "",
-            f"  {Colors.BOLD}--- [ PROXY ENVIRONMENT VARIABLES ] ---{Colors.RESET}",
+            f"  {Colors.BOLD}--- [ ENVIRONMENT VARIABLES ] ---{Colors.RESET}",
         ]
 
         # 0: AGY_U_PROXY
@@ -1035,7 +1039,7 @@ def run_interactive_tui(root_path: Optional[Path] = None):
         badge = Colors.BADGE_ENABLED if ag_active else Colors.BADGE_DISABLED
         t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
         ag_detail = f"  {state.ag_env}" if ag_active else ""
-        buf.append(f"{c_str}{t_col}{ENV_VAR_AG:<23}{Colors.RESET}: {badge}{ag_detail}")
+        buf.append(f"{c_str}{t_col}{ENV_VAR_AG:<29}{Colors.RESET}: {badge}{ag_detail}")
         buf.append(f"    {Colors.GRAY}Custom proxy env for language_server only (replaces default https_proxy){Colors.RESET}")
 
         # 1: HTTPS_PROXY
@@ -1045,35 +1049,45 @@ def run_interactive_tui(root_path: Optional[Path] = None):
         badge = Colors.BADGE_ENABLED if https_active else Colors.BADGE_DISABLED
         t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
         https_detail = f"  {state.https_env}" if https_active else ""
-        buf.append(f"{c_str}{t_col}{ENV_VAR_HTTPS:<23}{Colors.RESET}: {badge}{https_detail}")
+        buf.append(f"{c_str}{t_col}{ENV_VAR_HTTPS:<29}{Colors.RESET}: {badge}{https_detail}")
         buf.append(f"    {Colors.GRAY}Default global proxy env used by all apps{Colors.RESET}")
+
+        # 2: NODE_TLS_REJECT_UNAUTHORIZED
+        is_cur = (selected_idx == 2)
+        c_str = f"{Colors.CYAN}>{Colors.RESET} " if is_cur else "  "
+        tls_active = (state.node_tls_env == "0")
+        badge = Colors.BADGE_ENABLED if tls_active else Colors.BADGE_DISABLED
+        t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
+        tls_detail = f"  (value: {state.node_tls_env})" if state.node_tls_env is not None else ""
+        buf.append(f"{c_str}{t_col}{ENV_VAR_NODE_TLS:<29}{Colors.RESET}: {badge}{tls_detail}")
+        buf.append(f"    {Colors.GRAY}Bypass expired internal TLS cert for 127.0.0.1 LS (applies to all Node apps){Colors.RESET}")
 
         buf.append("")
         buf.append(f"  {Colors.BOLD}--- [ BINARY PATCHES ] ---{Colors.RESET}")
 
-        # Apps: 2 (Desktop), 3 (IDE), 4 (CLI)
-        for idx, cat in enumerate([AppCategory.DESKTOP, AppCategory.IDE, AppCategory.CLI], start=2):
+        # Apps: 3 (Desktop), 4 (IDE), 5 (CLI)
+        for idx, cat in enumerate([AppCategory.DESKTOP, AppCategory.IDE, AppCategory.CLI], start=3):
             is_cur = (selected_idx == idx)
             c_str = f"{Colors.CYAN}>{Colors.RESET} " if is_cur else "  "
             t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
             app_info = state.apps.get(cat)
             if app_info and app_info.get("scanning"):
-                buf.append(f"{c_str}{t_col}{cat:<23}{Colors.RESET}: {Colors.BADGE_SCANNING}")
+                buf.append(f"{c_str}{t_col}{cat:<29}{Colors.RESET}: {Colors.BADGE_SCANNING}")
                 buf.append(f"    {Colors.GRAY}Scanning installation directories...{Colors.RESET}")
             elif not app_info or not app_info["target"]:
-                buf.append(f"{c_str}{t_col}{cat:<23}{Colors.RESET}: {Colors.BADGE_NOT_FOUND}")
+                buf.append(f"{c_str}{t_col}{cat:<29}{Colors.RESET}: {Colors.BADGE_NOT_FOUND}")
                 buf.append(f"    {Colors.GRAY}Not found (press Space/Enter to specify custom path){Colors.RESET}")
             else:
                 st = app_info["status"]
                 b_badge = st["badge"] if st else Colors.BADGE_ERROR
                 sub_info = f"  Region: {st['region']} {Colors.GRAY}|{Colors.RESET} Custom proxy: {st['proxy']}" if st else ""
                 target_path = str(app_info["target"])
-                buf.append(f"{c_str}{t_col}{cat:<23}{Colors.RESET}: {b_badge}{sub_info}")
+                buf.append(f"{c_str}{t_col}{cat:<29}{Colors.RESET}: {b_badge}{sub_info}")
                 buf.append(f"    {Colors.GRAY}{target_path}{Colors.RESET}")
 
         buf.append("")
         buf.append(f"  {Colors.BOLD}--- [ ACTIONS ] ---{Colors.RESET}")
-        for idx in [5, 6, 7, 8]:
+        for idx in [6, 7, 8, 9]:
             item = items[idx]
             is_cur = (selected_idx == idx)
             c_str = f"{Colors.CYAN}>{Colors.RESET} " if is_cur else "  "
@@ -1206,6 +1220,20 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                                 state.refresh(progress_cb=cb)
                                 return (ok, f"Set {ENV_VAR_HTTPS} = {target_url_h}" if ok else f"Failed to set {ENV_VAR_HTTPS}.")
                             run_with_spinner(f"Setting {ENV_VAR_HTTPS}...", _enable_https)
+
+                elif t == "node_tls":
+                    if state.node_tls_env is not None:
+                        def _disable_tls(cb: Callable[[str], None]) -> Tuple[bool, str]:
+                            ok = set_env_var(ENV_VAR_NODE_TLS, None, progress_cb=cb)
+                            state.refresh(progress_cb=cb, sync_proxy=False)
+                            return (ok, f"Removed {ENV_VAR_NODE_TLS}." if ok else f"Failed to remove {ENV_VAR_NODE_TLS}.")
+                        run_with_spinner(f"Removing {ENV_VAR_NODE_TLS}...", _disable_tls)
+                    else:
+                        def _enable_tls(cb: Callable[[str], None]) -> Tuple[bool, str]:
+                            ok = set_env_var(ENV_VAR_NODE_TLS, "0", progress_cb=cb)
+                            state.refresh(progress_cb=cb, sync_proxy=False)
+                            return (ok, f"Set {ENV_VAR_NODE_TLS}=0." if ok else f"Failed to set {ENV_VAR_NODE_TLS}.")
+                        run_with_spinner(f"Setting {ENV_VAR_NODE_TLS}=0...", _enable_tls)
 
                 elif t == "app":
                     cat = curr["category"]
@@ -1371,6 +1399,16 @@ def main():
         help="Remove AGY_U_PROXY variable from OS environment and exit"
     )
     parser.add_argument(
+        "--set-tls-ignore",
+        action="store_true",
+        help=f"Set {ENV_VAR_NODE_TLS}=0 to bypass expired local TLS certificate and exit"
+    )
+    parser.add_argument(
+        "--unset-tls-ignore",
+        action="store_true",
+        help=f"Remove {ENV_VAR_NODE_TLS} variable from OS environment and exit"
+    )
+    parser.add_argument(
         "--path",
         help="Custom path to Antigravity directory or executable binary"
     )
@@ -1411,6 +1449,26 @@ def main():
         run_interactive_tui(root_path)
         return
 
+    if args.unset_tls_ignore:
+        sp = CliSpinner(f"Removing {ENV_VAR_NODE_TLS}...").start()
+        ok = set_env_var(ENV_VAR_NODE_TLS, None, progress_cb=sp.update)
+        sp.finish(f"Removed {ENV_VAR_NODE_TLS}." if ok else f"Failed to remove {ENV_VAR_NODE_TLS}.", ok=ok)
+        if ok:
+            print(f"[+] Removed {ENV_VAR_NODE_TLS} from environment.")
+        else:
+            print(f"[-] Failed to remove {ENV_VAR_NODE_TLS}.")
+        return
+
+    if args.set_tls_ignore:
+        sp = CliSpinner(f"Setting {ENV_VAR_NODE_TLS}=0...").start()
+        ok = set_env_var(ENV_VAR_NODE_TLS, "0", progress_cb=sp.update)
+        sp.finish(f"Set {ENV_VAR_NODE_TLS}=0" if ok else f"Failed to set {ENV_VAR_NODE_TLS}.", ok=ok)
+        if ok:
+            print(f"[+] Set {ENV_VAR_NODE_TLS}=0 (internal TLS certificate check bypassed).")
+        else:
+            print(f"[-] Failed to set {ENV_VAR_NODE_TLS}.")
+        return
+
     if args.unset_proxy:
         sp = CliSpinner(f"Removing {ENV_VAR_AG}...").start()
         ok = set_env_var(ENV_VAR_AG, None, progress_cb=sp.update)
@@ -1444,9 +1502,10 @@ def main():
 
     sp_scan = CliSpinner("Scanning installation directories...").start()
     grouped = get_categorized_targets(root_path)
-    sp_scan.update("Reading proxy environment variables...")
+    sp_scan.update("Reading environment variables...")
     cur_ag = get_current_env_var(ENV_VAR_AG)
     cur_https = get_current_env_var(ENV_VAR_HTTPS)
+    cur_tls = get_current_env_var(ENV_VAR_NODE_TLS)
     sp_scan.finish()
 
     if args.proxy and not args.no_env and not args.unpatch:
@@ -1465,6 +1524,8 @@ def main():
     print("=" * 68)
     print(f"[*] {ENV_VAR_AG}:    {cur_ag or '<Not Set>'}  (Custom proxy env for language_server only, replaces default https_proxy)")
     print(f"[*] {ENV_VAR_HTTPS}: {cur_https or '<Not Set>'}  (Default global proxy env used by all apps)")
+    tls_badge = f"{cur_tls} [Bypassed]" if cur_tls == "0" else (cur_tls or "<Not Set>")
+    print(f"[*] {ENV_VAR_NODE_TLS}: {tls_badge}  (Bypass expired internal TLS cert for language_server)")
 
     if args.status:
         for cat in ALL_CATEGORIES:
