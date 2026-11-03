@@ -26,7 +26,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 
 # Byte signatures (Exact length match is mandatory)
 SIG_REGION_FROM = b"ineligible"   # 10 bytes
@@ -44,8 +44,6 @@ DEFAULT_PROXY_URL = "http://127.0.0.1:10808"
 ENV_VAR_AG = "AGY_U_PROXY"
 ENV_VAR_HTTPS = "HTTPS_PROXY"
 ENV_VAR_NODE_TLS = "NODE_TLS_REJECT_UNAUTHORIZED"
-ENV_VAR_NO_PROXY = "NO_PROXY"
-DEFAULT_NO_PROXY = "localhost,127.0.0.1,oauth2.googleapis.com,accounts.google.com"
 
 LOCKED_PROCESSES_WIN = [
     "language_server.exe",
@@ -382,11 +380,7 @@ def set_env_var(name: str, value: Optional[str], progress_cb: Optional[Callable[
     target_vars = [name]
     if name == ENV_VAR_HTTPS:
         target_vars.append("HTTP_PROXY")
-    # Automatically ensure NO_PROXY is set when enabling proxy to prevent Google OAuth EOF
-    if name in (ENV_VAR_AG, ENV_VAR_HTTPS) and value is not None:
-        if not os.environ.get("NO_PROXY"):
-            set_env_var("NO_PROXY", DEFAULT_NO_PROXY)
-            set_env_var("no_proxy", DEFAULT_NO_PROXY)
+
 
     for v_name in target_vars:
         if value is None:
@@ -1658,7 +1652,6 @@ def main():
     cur_ag = get_current_env_var(ENV_VAR_AG)
     cur_https = get_current_env_var(ENV_VAR_HTTPS)
     cur_tls = get_current_env_var(ENV_VAR_NODE_TLS)
-    cur_no_proxy = get_current_env_var(ENV_VAR_NO_PROXY)
     sp_scan.finish()
 
     if args.proxy and not args.no_env and not args.unpatch:
@@ -1679,7 +1672,6 @@ def main():
     print(f"[*] {ENV_VAR_HTTPS}: {cur_https or '<Not Set>'}  (Default global proxy env used by all apps)")
     tls_badge = f"{cur_tls} [Bypassed]" if cur_tls == "0" else (cur_tls or "<Not Set>")
     print(f"[*] {ENV_VAR_NODE_TLS}: {tls_badge}  (Bypass expired internal TLS cert for language_server)")
-    print(f"[*] {ENV_VAR_NO_PROXY}: {cur_no_proxy or '<Not Set>'}  (Bypass proxy for local & Google OAuth endpoints)")
 
     if args.status:
         for cat in ALL_CATEGORIES:
