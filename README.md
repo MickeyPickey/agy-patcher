@@ -1,4 +1,4 @@
-# Antigravity Patcher v1.4.0
+# Antigravity Patcher v1.4.4
 
 [Русский](#русский) | [English](#english)
 
@@ -37,7 +37,9 @@
 
 Идея проекта вдохновлена репозиторием [confeden/Antigravity](https://github.com/confeden/Antigravity.git) и адаптирована для персонального использования с собственным локальным прокси.
 
-### Быстрый запуск
+### Быстрый запуск и установка
+
+При первом запуске скрипт предложит установить `agy-patcher` в систему (PATH). После установки патчер доступен напрямую через команду `agy-patcher` в любом терминале (PowerShell, CMD, Bash).
 
 **Windows (PowerShell):**
 ```powershell
@@ -65,16 +67,18 @@ curl -fsSL https://raw.githubusercontent.com/MickeyPickey/agy-patcher/main/run.s
 ### Консольные команды
 
 ```bash
-antigravity-patcher.exe --status              # Проверить статус
-antigravity-patcher.exe --patch               # Пропатчить все
-antigravity-patcher.exe --unpatch             # Откатить все
-antigravity-patcher.exe --proxy http://127.0.0.1:10808
-antigravity-patcher.exe --set-proxy           # Задать AGY_U_PROXY
-antigravity-patcher.exe --unset-proxy         # Удалить AGY_U_PROXY
-antigravity-patcher.exe --set-https-proxy     # Задать HTTPS_PROXY и HTTP_PROXY (для работы без TUN)
-antigravity-patcher.exe --unset-https-proxy   # Удалить HTTPS_PROXY и HTTP_PROXY
-antigravity-patcher.exe --set-tls-ignore      # Включить обход истекшего TLS-сертификата (NODE_TLS_REJECT_UNAUTHORIZED=0)
-antigravity-patcher.exe --unset-tls-ignore    # Отключить обход TLS-сертификата
+agy-patcher --status              # Проверить статус
+agy-patcher --patch               # Пропатчить все
+agy-patcher --unpatch             # Откатить все
+agy-patcher --proxy http://127.0.0.1:10808
+agy-patcher --set-proxy           # Задать AGY_U_PROXY
+agy-patcher --unset-proxy         # Удалить AGY_U_PROXY
+agy-patcher --set-https-proxy     # Задать HTTPS_PROXY и HTTP_PROXY (для работы без TUN)
+agy-patcher --unset-https-proxy   # Удалить HTTPS_PROXY и HTTP_PROXY
+agy-patcher --set-tls-ignore      # Включить обход истекшего TLS-сертификата (NODE_TLS_REJECT_UNAUTHORIZED=0)
+agy-patcher --unset-tls-ignore    # Отключить обход TLS-сертификата
+agy-patcher --update              # Проверить и обновить патчер до актуальной версии
+agy-patcher --uninstall           # Удалить патчер из системы и очистить PATH
 ```
 
 > **Если ранее стоял сторонний анлокер (Windows):**  
@@ -115,7 +119,9 @@ Setting `NODE_TLS_REJECT_UNAUTHORIZED=0` instructs Node.js/Electron to accept th
 
 This project was inspired by [confeden/Antigravity](https://github.com/confeden/Antigravity.git) and adapted for personal use with your own custom proxy.
 
-### Quick Start
+### Quick Start & Installation
+
+On first run, the script prompts to install `agy-patcher` into your system PATH. Once installed, it is directly accessible as `agy-patcher` from any terminal (PowerShell, CMD, Bash).
 
 **Windows (PowerShell):**
 ```powershell
@@ -143,16 +149,18 @@ curl -fsSL https://raw.githubusercontent.com/MickeyPickey/agy-patcher/main/run.s
 ### CLI Commands
 
 ```bash
-antigravity-patcher.exe --status              # Check status
-antigravity-patcher.exe --patch               # Patch all
-antigravity-patcher.exe --unpatch             # Revert all
-antigravity-patcher.exe --proxy http://127.0.0.1:10808
-antigravity-patcher.exe --set-proxy           # Set AGY_U_PROXY
-antigravity-patcher.exe --unset-proxy         # Remove AGY_U_PROXY
-antigravity-patcher.exe --set-https-proxy     # Set HTTPS_PROXY and HTTP_PROXY (for non-TUN operation)
-antigravity-patcher.exe --unset-https-proxy   # Remove HTTPS_PROXY and HTTP_PROXY
-antigravity-patcher.exe --set-tls-ignore      # Enable expired TLS cert bypass (NODE_TLS_REJECT_UNAUTHORIZED=0)
-antigravity-patcher.exe --unset-tls-ignore    # Disable TLS cert bypass
+agy-patcher --status              # Check status
+agy-patcher --patch               # Patch all
+agy-patcher --unpatch             # Revert all
+agy-patcher --proxy http://127.0.0.1:10808
+agy-patcher --set-proxy           # Set AGY_U_PROXY
+agy-patcher --unset-proxy         # Remove AGY_U_PROXY
+agy-patcher --set-https-proxy     # Set HTTPS_PROXY and HTTP_PROXY (for non-TUN operation)
+agy-patcher --unset-https-proxy   # Remove HTTPS_PROXY and HTTP_PROXY
+agy-patcher --set-tls-ignore      # Enable expired TLS cert bypass (NODE_TLS_REJECT_UNAUTHORIZED=0)
+agy-patcher --unset-tls-ignore    # Disable TLS cert bypass
+agy-patcher --update              # Check for updates and update in place
+agy-patcher --uninstall           # Uninstall agy-patcher and clean PATH
 ```
 
 > **Windows note (if you used full unlockers previously):**  

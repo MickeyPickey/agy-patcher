@@ -3,7 +3,9 @@ chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
 
-if exist "%~dp0antigravity-patcher.exe" (
+if exist "%~dp0agy-patcher.exe" (
+    "%~dp0agy-patcher.exe" %*
+) else if exist "%~dp0antigravity-patcher.exe" (
     "%~dp0antigravity-patcher.exe" %*
 ) else (
     python patcher.py %*

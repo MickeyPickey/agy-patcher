@@ -26,16 +26,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller
 
-      - name: Build antigravity-patcher.exe
+      - name: Build agy-patcher.exe
         run: |
-          pyinstaller --onefile --console --clean --name antigravity-patcher --distpath . patcher.py
+          pyinstaller --onefile --console --clean --name agy-patcher --distpath . patcher.py
 
       - name: Verify executable
         run: |
-          ./antigravity-patcher.exe --help
+          ./agy-patcher.exe --help
 
       - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
-          files: antigravity-patcher.exe
+          files: agy-patcher.exe
           generate_release_notes: true

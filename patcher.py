@@ -18,6 +18,7 @@ import shutil
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -26,7 +27,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 
 # Byte signatures (Exact length match is mandatory)
 SIG_REGION_FROM = b"ineligible"   # 10 bytes
@@ -44,6 +45,9 @@ DEFAULT_PROXY_URL = "http://127.0.0.1:10808"
 ENV_VAR_AG = "AGY_U_PROXY"
 ENV_VAR_HTTPS = "HTTPS_PROXY"
 ENV_VAR_NODE_TLS = "NODE_TLS_REJECT_UNAUTHORIZED"
+
+GITHUB_REPO = os.environ.get("AGY_REPO", "MickeyPickey/agy-patcher")
+GITHUB_BRANCH = os.environ.get("AGY_BRANCH", "main")
 
 LOCKED_PROCESSES_WIN = [
     "language_server.exe",
@@ -679,6 +683,211 @@ def get_current_env_var(name: str) -> Optional[str]:
                 except Exception:
                     pass
         return os.environ.get(name)
+
+
+# ============================================================================
+# Installation & Self-Management
+# ============================================================================
+
+def parse_version(v: str) -> Tuple[int, ...]:
+    """Parse version string like '1.4.3' or 'v1.4.3' into a tuple of ints."""
+    nums = re.findall(r"\d+", v)
+    return tuple(int(n) for n in nums) if nums else (0,)
+
+
+def fetch_remote_info() -> Tuple[Optional[str], Optional[str]]:
+    """Fetch remote version and script content from GitHub repository."""
+    url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/patcher.py?cb={int(time.time())}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "agy-patcher"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            content = resp.read().decode("utf-8", errors="replace")
+            m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', content)
+            if m:
+                return m.group(1), content
+    except Exception:
+        pass
+    return None, None
+
+
+def self_update() -> bool:
+    """Update agy-patcher in-place to the latest version."""
+    sp = CliSpinner("Checking for updates...").start()
+    remote_ver, remote_content = fetch_remote_info()
+    if not remote_ver:
+        sp.finish("Failed to check for updates (could not reach GitHub).", ok=False)
+        print("[-] Could not retrieve latest version from GitHub.")
+        return False
+
+    cur_v = parse_version(__version__)
+    rem_v = parse_version(remote_ver)
+
+    if rem_v <= cur_v:
+        sp.finish(f"Up to date (v{__version__}).", ok=True)
+        print(f"[+] agy-patcher is already up to date (v{__version__}).")
+        return True
+
+    sp.finish(f"Found new version: v{remote_ver}", ok=True)
+    print(f"[*] Updating agy-patcher: v{__version__} -> v{remote_ver}...")
+
+    is_frozen_win = is_windows() and getattr(sys, "frozen", False)
+    if is_frozen_win:
+        exe_path = Path(sys.executable).resolve()
+        urls = [
+            f"https://github.com/{GITHUB_REPO}/releases/download/v{remote_ver}/agy-patcher.exe",
+            f"https://github.com/{GITHUB_REPO}/releases/download/v{remote_ver}/antigravity-patcher.exe",
+            f"https://github.com/{GITHUB_REPO}/releases/latest/download/agy-patcher.exe",
+            f"https://github.com/{GITHUB_REPO}/releases/latest/download/antigravity-patcher.exe",
+        ]
+        old_exe = exe_path.with_name(f"{exe_path.name}.old")
+        tmp_exe = exe_path.with_name(f"{exe_path.name}.new")
+
+        if old_exe.exists():
+            try:
+                old_exe.unlink()
+            except Exception:
+                pass
+
+        downloaded = False
+        for u in urls:
+            try:
+                req = urllib.request.Request(u, headers={"User-Agent": "agy-patcher"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = resp.read()
+                    if len(data) > 100000:
+                        tmp_exe.write_bytes(data)
+                        if exe_path.exists():
+                            os.rename(exe_path, old_exe)
+                        os.rename(tmp_exe, exe_path)
+                        downloaded = True
+                        break
+            except Exception:
+                continue
+
+        if downloaded:
+            print(f"[+] Successfully updated agy-patcher to v{remote_ver}!")
+            return True
+        else:
+            print("[-] Failed to download updated executable from GitHub releases.")
+            return False
+    else:
+        # Script update (Linux or Windows script)
+        script_path = Path(__file__).resolve()
+        if not remote_content:
+            remote_ver, remote_content = fetch_remote_info()
+        if not remote_content:
+            print("[-] Failed to download latest script content.")
+            return False
+        try:
+            tmp_script = script_path.with_suffix(".py.tmp")
+            tmp_script.write_text(remote_content, encoding="utf-8")
+            os.replace(tmp_script, script_path)
+            print(f"[+] Successfully updated agy-patcher to v{remote_ver}!")
+            return True
+        except Exception as exc:
+            print(f"[-] Failed to update script: {exc}")
+            return False
+
+
+def self_uninstall(assume_yes: bool = False) -> bool:
+    """Uninstall agy-patcher files and clean PATH environment."""
+    if not assume_yes:
+        try:
+            ans = input("[?] Are you sure you want to uninstall agy-patcher? [y/N]: ").strip().lower()
+            if ans not in ("y", "yes"):
+                print("[*] Uninstallation cancelled.")
+                return False
+        except (KeyboardInterrupt, EOFError):
+            print("\n[*] Uninstallation cancelled.")
+            return False
+
+    if is_windows():
+        local_app = os.environ.get("LOCALAPPDATA")
+        if not local_app:
+            local_app = str(Path.home() / "AppData" / "Local")
+        target_dir = Path(local_app) / "agy-patcher"
+
+        # Remove from User PATH in Registry
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_ALL_ACCESS) as key:
+                cur_path, ptype = winreg.QueryValueEx(key, "Path")
+                parts = [p.strip() for p in cur_path.split(";") if p.strip()]
+                new_parts = [p for p in parts if str(target_dir).lower() not in p.lower() and "agy-patcher" not in p.lower()]
+                if len(parts) != len(new_parts):
+                    new_path = ";".join(new_parts)
+                    winreg.SetValueEx(key, "Path", 0, ptype, new_path)
+                    print("[+] Removed agy-patcher from User PATH in registry.")
+                    # Broadcast WM_SETTINGCHANGE
+                    ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x001A, 0, "Environment", 0x0002, 3000, None)
+        except Exception:
+            ps = f'''
+            $p = [Environment]::GetEnvironmentVariable("Path", "User")
+            if ($p) {{
+                $arr = ($p -split ";") | Where-Object {{ $_ -and ($_ -notlike "*{target_dir}*") -and ($_ -notlike "*agy-patcher*") }}
+                [Environment]::SetEnvironmentVariable("Path", ($arr -join ";"), "User")
+            }}
+            '''
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Remove directory
+        is_frozen = getattr(sys, "frozen", False)
+        exe_in_target = is_frozen and target_dir in Path(sys.executable).resolve().parents
+        if exe_in_target:
+            cmd = f'timeout /t 1 /nobreak >nul & rmdir /s /q "{target_dir}"'
+            subprocess.Popen(f'cmd.exe /c "{cmd}"', shell=True)
+            print(f"[+] Scheduled removal of {target_dir}.")
+        else:
+            if target_dir.exists():
+                shutil.rmtree(target_dir, ignore_errors=True)
+                print(f"[+] Removed {target_dir}.")
+
+        print("[+] agy-patcher has been completely uninstalled.")
+        return True
+    else:
+        # Linux
+        for home in _get_linux_home_dirs():
+            bin_path = home / ".local" / "bin" / "agy-patcher"
+            if bin_path.exists() or bin_path.is_symlink():
+                try:
+                    bin_path.unlink()
+                    print(f"[+] Removed {bin_path}")
+                except Exception as exc:
+                    print(f"[-] Could not remove {bin_path}: {exc}")
+
+            share_dir = home / ".local" / "share" / "agy-patcher"
+            if share_dir.exists():
+                try:
+                    shutil.rmtree(share_dir, ignore_errors=True)
+                    print(f"[+] Removed {share_dir}")
+                except Exception as exc:
+                    print(f"[-] Could not remove {share_dir}: {exc}")
+
+            # Clean PATH snippet from shell rc files
+            for rc_name in (".bashrc", ".zshrc", ".profile"):
+                rc_file = home / rc_name
+                if rc_file.is_file():
+                    try:
+                        content = rc_file.read_text(encoding="utf-8", errors="ignore")
+                        lines = content.splitlines()
+                        clean_lines = []
+                        skip = False
+                        for line in lines:
+                            if line.strip() == "# agy-patcher PATH":
+                                skip = True
+                                continue
+                            if skip and 'export PATH="$HOME/.local/bin:$PATH"' in line:
+                                skip = False
+                                continue
+                            clean_lines.append(line)
+                        if len(clean_lines) != len(lines):
+                            rc_file.write_text("\n".join(clean_lines) + "\n", encoding="utf-8")
+                            print(f"[+] Cleaned PATH configuration from {rc_file.name}")
+                    except Exception:
+                        pass
+
+        print("[+] agy-patcher has been completely uninstalled.")
+        return True
 
 
 # ============================================================================
@@ -1725,6 +1934,22 @@ def main():
         help="Print status of all applications and proxy variables without changes"
     )
     parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Check for updates and update agy-patcher in place"
+    )
+    parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Uninstall agy-patcher from the system and clean PATH"
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Confirm prompts automatically without interaction"
+    )
+    parser.add_argument(
         "--tui",
         "-m",
         action="store_true",
@@ -1732,6 +1957,24 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Clean up lingering .old file on Windows from previous updates
+    if is_windows():
+        try:
+            exe_target = Path(sys.executable if getattr(sys, "frozen", False) else __file__)
+            old_file = exe_target.with_name(f"{exe_target.name}.old")
+            if old_file.exists():
+                old_file.unlink()
+        except Exception:
+            pass
+
+    if args.update:
+        self_update()
+        return
+
+    if args.uninstall:
+        self_uninstall(assume_yes=args.yes)
+        return
 
     root_path = Path(args.path).resolve() if args.path else None
 
