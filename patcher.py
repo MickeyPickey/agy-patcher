@@ -10,9 +10,13 @@ Interactive Terminal UI (TUI) and CLI tool to:
 
 import argparse
 import ctypes
+import ctypes.util
+import datetime
+import json
 import os
 import platform
 import re
+import select
 import subprocess
 import shutil
 import sys
@@ -20,7 +24,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -686,6 +690,154 @@ def get_current_env_var(name: str) -> Optional[str]:
 
 
 # ============================================================================
+# Configuration, Logging & Desktop Notifications
+# ============================================================================
+
+WATCH_LOG_MAX_BYTES = 1024 * 1024  # 1 MB
+WIN_TASK_NAME = "AgyPatcherAutoWatch"
+SYSTEMD_SERVICE_NAME = "agy-patcher-watch.service"
+
+
+def get_state_dir() -> Path:
+    """Return cross-platform state/config directory for agy-patcher."""
+    if is_windows():
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "agy-patcher"
+    xdg_state = os.environ.get("XDG_STATE_HOME")
+    if xdg_state:
+        return Path(xdg_state) / "agy-patcher"
+    return Path.home() / ".local" / "state" / "agy-patcher"
+
+
+def get_config_path() -> Path:
+    return get_state_dir() / "config.json"
+
+
+def get_pid_path() -> Path:
+    return get_state_dir() / "watch.pid"
+
+
+def get_log_path() -> Path:
+    return get_state_dir() / "watch.log"
+
+
+def load_config() -> Dict[str, Any]:
+    """Load persisted patcher configuration with safe defaults."""
+    defaults: Dict[str, Any] = {
+        "auto_patch": False,
+        "notifications": True,
+        "custom_paths": {},
+    }
+    cfg_path = get_config_path()
+    try:
+        if cfg_path.is_file():
+            raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                defaults["auto_patch"] = bool(raw.get("auto_patch", False))
+                defaults["notifications"] = bool(raw.get("notifications", True))
+                cp = raw.get("custom_paths", {})
+                if isinstance(cp, dict):
+                    defaults["custom_paths"] = {
+                        str(k): str(v) for k, v in cp.items() if isinstance(k, str) and isinstance(v, str)
+                    }
+    except Exception:
+        pass
+    return defaults
+
+
+def save_config(cfg: Dict[str, Any]) -> bool:
+    """Atomically persist configuration to disk."""
+    cfg_path = get_config_path()
+    try:
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cfg_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        os.replace(tmp, cfg_path)
+        return True
+    except Exception:
+        return False
+
+
+def _watch_log(msg: str, echo: bool = False) -> None:
+    """Append timestamped line to rotating watch.log (capped at ~1 MB)."""
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    if echo:
+        try:
+            print(line, flush=True)
+        except Exception:
+            pass
+    log_path = get_log_path()
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if log_path.exists() and log_path.stat().st_size >= WATCH_LOG_MAX_BYTES:
+            bak = log_path.with_suffix(".log.1")
+            try:
+                if bak.exists():
+                    bak.unlink()
+                os.replace(log_path, bak)
+            except Exception:
+                pass
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def send_notification(title: str, message: str) -> None:
+    """Send a best-effort, non-blocking OS notification if notifications are enabled."""
+    if not load_config().get("notifications", True):
+        return
+    try:
+        if is_windows():
+            safe_t = title.replace("'", "''").replace('"', "")
+            safe_m = message.replace("'", "''").replace('"', "")
+            ps = (
+                "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null;"
+                "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null;"
+                f"$xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+                f"$texts = $xml.GetElementsByTagName('text');"
+                f"$texts.Item(0).AppendChild($xml.CreateTextNode('{safe_t}')) > $null;"
+                f"$texts.Item(1).AppendChild($xml.CreateTextNode('{safe_m}')) > $null;"
+                "$toast = [Windows.UI.Notifications.ToastNotification]::new($xml);"
+                "$appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe';"
+                "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast);"
+            )
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=creation_flags,
+            )
+        else:
+            termux_notify = shutil.which("termux-notification") or (
+                "/data/data/com.termux/files/usr/bin/termux-notification"
+                if Path("/data/data/com.termux/files/usr/bin/termux-notification").exists()
+                else None
+            )
+            if termux_notify:
+                subprocess.Popen(
+                    [termux_notify, "--title", title, "--content", message],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                )
+                return
+            notify_send = shutil.which("notify-send")
+            if notify_send:
+                subprocess.Popen(
+                    [notify_send, "-a", "Antigravity Patcher", title, message],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                )
+    except Exception:
+        pass
+
+
+# ============================================================================
 # Installation & Self-Management
 # ============================================================================
 
@@ -731,6 +883,10 @@ def self_update() -> bool:
     print(f"[*] Updating agy-patcher: v{__version__} -> v{remote_ver}...")
 
     is_frozen_win = is_windows() and getattr(sys, "frozen", False)
+    was_watching = get_watcher_pid() is not None
+    if was_watching:
+        stop_watcher()
+
     if is_frozen_win:
         exe_path = Path(sys.executable).resolve()
         urls = [
@@ -766,9 +922,13 @@ def self_update() -> bool:
 
         if downloaded:
             print(f"[+] Successfully updated agy-patcher to v{remote_ver}!")
+            if was_watching:
+                start_watcher_background()
             return True
         else:
             print("[-] Failed to download updated executable from GitHub releases.")
+            if was_watching:
+                start_watcher_background()
             return False
     else:
         # Script update (Linux or Windows script)
@@ -777,15 +937,21 @@ def self_update() -> bool:
             remote_ver, remote_content = fetch_remote_info()
         if not remote_content:
             print("[-] Failed to download latest script content.")
+            if was_watching:
+                start_watcher_background()
             return False
         try:
             tmp_script = script_path.with_suffix(".py.tmp")
             tmp_script.write_text(remote_content, encoding="utf-8")
             os.replace(tmp_script, script_path)
             print(f"[+] Successfully updated agy-patcher to v{remote_ver}!")
+            if was_watching:
+                start_watcher_background()
             return True
         except Exception as exc:
             print(f"[-] Failed to update script: {exc}")
+            if was_watching:
+                start_watcher_background()
             return False
 
 
@@ -800,6 +966,11 @@ def self_uninstall(assume_yes: bool = False) -> bool:
         except (KeyboardInterrupt, EOFError):
             print("\n[*] Uninstallation cancelled.")
             return False
+
+    try:
+        disable_auto_patch()
+    except Exception:
+        pass
 
     if is_windows():
         local_app = os.environ.get("LOCALAPPDATA")
@@ -855,13 +1026,16 @@ def self_uninstall(assume_yes: bool = False) -> bool:
                 except Exception as exc:
                     print(f"[-] Could not remove {bin_path}: {exc}")
 
-            share_dir = home / ".local" / "share" / "agy-patcher"
-            if share_dir.exists():
-                try:
-                    shutil.rmtree(share_dir, ignore_errors=True)
-                    print(f"[+] Removed {share_dir}")
-                except Exception as exc:
-                    print(f"[-] Could not remove {share_dir}: {exc}")
+            for sub_dir in (
+                home / ".local" / "share" / "agy-patcher",
+                home / ".local" / "state" / "agy-patcher",
+            ):
+                if sub_dir.exists():
+                    try:
+                        shutil.rmtree(sub_dir, ignore_errors=True)
+                        print(f"[+] Removed {sub_dir}")
+                    except Exception as exc:
+                        print(f"[-] Could not remove {sub_dir}: {exc}")
 
             # Clean PATH snippet from shell rc files
             for rc_name in (".bashrc", ".zshrc", ".profile"):
@@ -1154,6 +1328,7 @@ class PatchResult:
         self.region_replaced = 0
         self.proxy_replaced = 0
         self.already_patched = False
+        self.locked = False
         self.error: Optional[str] = None
 
 
@@ -1196,7 +1371,8 @@ def patch_file(
     unpatch: bool = False,
     patch_proxy: bool = False,
     proxy_only: bool = False,
-    progress_cb: Optional[Callable[[str], None]] = None
+    progress_cb: Optional[Callable[[str], None]] = None,
+    allow_kill: bool = True
 ) -> PatchResult:
     """Perform in-place byte replacement on a binary file."""
     res = PatchResult(path)
@@ -1307,6 +1483,14 @@ def patch_file(
                     pass
 
             if not replaced:
+                if not allow_kill:
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    res.locked = True
+                    res.error = "File is locked by running process"
+                    return res
                 if progress_cb:
                     progress_cb(f"Stopping locking processes for {path.name}...")
                 kill_locking_processes()
@@ -1414,6 +1598,643 @@ def get_binary_status(
 # Interactive Terminal User Interface (TUI)
 # ============================================================================
 
+# ============================================================================
+# Background Auto-Patch Watcher & Cross-Platform Auto-Start
+# ============================================================================
+
+def _is_pid_running(pid: int) -> bool:
+    """Check whether a process with the given PID is currently alive."""
+    if pid <= 0:
+        return False
+    if is_windows():
+        try:
+            kernel32 = ctypes.windll.kernel32
+            h = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            try:
+                exit_code = ctypes.c_ulong()
+                if kernel32.GetExitCodeProcess(h, ctypes.byref(exit_code)):
+                    return exit_code.value == 259  # STILL_ACTIVE
+                return False
+            finally:
+                kernel32.CloseHandle(h)
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+
+
+def get_watcher_pid() -> Optional[int]:
+    """Return PID of active background watcher if running, else None."""
+    pid_file = get_pid_path()
+    if not pid_file.is_file():
+        return None
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+        if _is_pid_running(pid):
+            return pid
+    except Exception:
+        pass
+    try:
+        pid_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return None
+
+
+def stop_watcher() -> bool:
+    """Stop any running background watcher process cleanly."""
+    pid = get_watcher_pid()
+    if pid is None:
+        return True
+    try:
+        if is_windows():
+            kernel32 = ctypes.windll.kernel32
+            h = kernel32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+            if h:
+                try:
+                    kernel32.TerminateProcess(h, 0)
+                finally:
+                    kernel32.CloseHandle(h)
+        else:
+            import signal
+            os.kill(pid, signal.SIGTERM)
+            deadline = time.time() + 2.0
+            while time.time() < deadline and _is_pid_running(pid):
+                time.sleep(0.1)
+            if _is_pid_running(pid):
+                os.kill(pid, signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        get_pid_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+    return get_watcher_pid() is None
+
+
+def get_self_launch_command() -> List[str]:
+    """Return command vector to invoke this agy-patcher executable or script."""
+    if getattr(sys, "frozen", False):
+        return [str(Path(sys.executable).resolve())]
+    return [str(Path(sys.executable).resolve()), str(Path(__file__).resolve())]
+
+
+def start_watcher_background() -> bool:
+    """Spawn detached background watcher if not already running."""
+    if get_watcher_pid() is not None:
+        return True
+    cmd = get_self_launch_command() + ["--watch"]
+    try:
+        if is_windows():
+            flags = (
+                getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            )
+            subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=flags,
+            )
+        else:
+            subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        deadline = time.time() + 1.5
+        while time.time() < deadline:
+            if get_watcher_pid() is not None:
+                return True
+            time.sleep(0.1)
+    except Exception:
+        return False
+    return get_watcher_pid() is not None
+
+
+def _has_systemd_user() -> bool:
+    """Return True if systemd --user session is active (False on Termux/PRoot)."""
+    if is_windows() or not shutil.which("systemctl"):
+        return False
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "is-system-running"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+        # 0 = running, 1 = degraded/starting; >1 or connection error means no user bus
+        if res.returncode in (0, 1):
+            return True
+        res2 = subprocess.run(
+            ["systemctl", "--user", "list-units"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+        return res2.returncode == 0
+    except Exception:
+        return False
+
+
+def _get_win_vbs_path() -> Path:
+    return get_state_dir() / "launch-watch.vbs"
+
+
+def _get_systemd_unit_path() -> Path:
+    return Path.home() / ".config" / "systemd" / "user" / SYSTEMD_SERVICE_NAME
+
+
+def _strip_shell_autostart(rc_file: Path) -> bool:
+    """Remove '# agy-patcher auto-watch' block from a shell rc file."""
+    if not rc_file.is_file():
+        return False
+    try:
+        lines = rc_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+        out: List[str] = []
+        skip = False
+        changed = False
+        for line in lines:
+            if line.strip() == "# agy-patcher auto-watch":
+                skip = True
+                changed = True
+                continue
+            if skip:
+                if line.strip() == "# end agy-patcher auto-watch":
+                    skip = False
+                continue
+            out.append(line)
+        if changed:
+            rc_file.write_text("\n".join(out) + "\n", encoding="utf-8")
+        return changed
+    except Exception:
+        return False
+
+
+def register_autostart() -> bool:
+    """Register OS-native auto-start for the background watcher."""
+    cmd = get_self_launch_command() + ["--watch"]
+    if is_windows():
+        try:
+            vbs_path = _get_win_vbs_path()
+            vbs_path.parent.mkdir(parents=True, exist_ok=True)
+            quoted_cmd = " ".join(f'""{c}""' for c in cmd)
+            vbs_content = f'CreateObject("WScript.Shell").Run "{quoted_cmd}", 0, False\r\n'
+            vbs_path.write_text(vbs_content, encoding="utf-8")
+            tr = f'wscript.exe //B //Nologo "{vbs_path}"'
+            res = subprocess.run(
+                [
+                    "schtasks", "/Create",
+                    "/TN", WIN_TASK_NAME,
+                    "/TR", tr,
+                    "/SC", "ONLOGON",
+                    "/RL", "LIMITED",
+                    "/F",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return res.returncode == 0
+        except Exception:
+            return False
+
+    if _has_systemd_user():
+        try:
+            unit_path = _get_systemd_unit_path()
+            unit_path.parent.mkdir(parents=True, exist_ok=True)
+            exec_line = " ".join(f'"{c}"' if " " in c else c for c in cmd)
+            unit_body = (
+                "[Unit]\n"
+                "Description=Antigravity Patcher Auto-Watch Service\n"
+                "After=default.target\n\n"
+                "[Service]\n"
+                f"ExecStart={exec_line}\n"
+                "Restart=on-failure\n"
+                "RestartSec=5\n\n"
+                "[Install]\n"
+                "WantedBy=default.target\n"
+            )
+            unit_path.write_text(unit_body, encoding="utf-8")
+            subprocess.run(["systemctl", "--user", "daemon-reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            res = subprocess.run(
+                ["systemctl", "--user", "enable", "--now", SYSTEMD_SERVICE_NAME],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return res.returncode == 0
+        except Exception:
+            return False
+
+    # Termux / PRoot / non-systemd Linux: PID-guarded shell startup hook
+    script_path = str(Path(__file__).resolve())
+    snippet = (
+        "# agy-patcher auto-watch\n"
+        "if command -v agy-patcher >/dev/null 2>&1; then\n"
+        "  agy-patcher --watch-daemon >/dev/null 2>&1\n"
+        f'elif [ -f "{script_path}" ]; then\n'
+        f'  "{sys.executable}" "{script_path}" --watch-daemon >/dev/null 2>&1\n'
+        "fi\n"
+        "# end agy-patcher auto-watch\n"
+    )
+    ok_any = False
+    for home in _get_linux_home_dirs():
+        targets = [home / n for n in (".bashrc", ".zshrc", ".profile") if (home / n).is_file()]
+        if not targets:
+            targets = [home / ".bashrc"]
+        for rc in targets:
+            try:
+                _strip_shell_autostart(rc)
+                existing = rc.read_text(encoding="utf-8", errors="ignore") if rc.exists() else ""
+                sep = "\n" if existing and not existing.endswith("\n") else ""
+                rc.write_text(existing + sep + snippet, encoding="utf-8")
+                ok_any = True
+            except Exception:
+                pass
+    return ok_any
+
+
+def unregister_autostart() -> None:
+    """Remove OS-native auto-start entries."""
+    if is_windows():
+        try:
+            subprocess.run(
+                ["schtasks", "/Delete", "/TN", WIN_TASK_NAME, "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            pass
+        try:
+            _get_win_vbs_path().unlink(missing_ok=True)
+        except Exception:
+            pass
+        return
+
+    if _has_systemd_user():
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "disable", "--now", SYSTEMD_SERVICE_NAME],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            _get_systemd_unit_path().unlink(missing_ok=True)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        except Exception:
+            pass
+
+    for home in _get_linux_home_dirs():
+        for rc_name in (".bashrc", ".zshrc", ".profile"):
+            _strip_shell_autostart(home / rc_name)
+
+
+def enable_auto_patch() -> Tuple[bool, str]:
+    """Enable auto-patching, register OS auto-start, and start the watcher."""
+    cfg = load_config()
+    cfg["auto_patch"] = True
+    save_config(cfg)
+    reg_ok = register_autostart()
+    if _has_systemd_user():
+        started = get_watcher_pid() is not None or start_watcher_background()
+    else:
+        started = start_watcher_background()
+    if started and reg_ok:
+        return True, "Auto-Patch Watchdog enabled and running."
+    if started:
+        return True, "Auto-Patch Watchdog running (auto-start registration partial)."
+    return False, "Failed to start background watcher."
+
+
+def disable_auto_patch() -> Tuple[bool, str]:
+    """Disable auto-patching, stop the watcher, and remove auto-start."""
+    cfg = load_config()
+    cfg["auto_patch"] = False
+    save_config(cfg)
+    unregister_autostart()
+    stopped = stop_watcher()
+    return stopped, ("Auto-Patch Watchdog disabled." if stopped else "Disabled config, but failed to stop watcher.")
+
+
+def _get_watch_directories(root_path: Optional[Path] = None) -> List[Path]:
+    """Collect directories to monitor for binary updates."""
+    dirs: Set[Path] = set()
+    for d in get_candidate_install_dirs():
+        dirs.add(d)
+    gemini_root = Path.home() / ".gemini"
+    if gemini_root.is_dir():
+        dirs.add(gemini_root)
+    if root_path and root_path.is_dir():
+        dirs.add(root_path)
+    cfg = load_config()
+    for p_str in cfg.get("custom_paths", {}).values():
+        p = Path(p_str)
+        if p.is_file() and p.parent.is_dir():
+            dirs.add(p.parent)
+        elif p.is_dir():
+            dirs.add(p)
+    return sorted(dirs)
+
+
+class _WindowsDirWatcher:
+    """Immediate directory change detector on Windows via ReadDirectoryChangesW."""
+    def __init__(self, change_event: threading.Event):
+        self.change_event = change_event
+        self._stop = threading.Event()
+        self._threads: Dict[Path, threading.Thread] = {}
+
+    def sync_dirs(self, dirs: List[Path]) -> None:
+        for d in dirs:
+            if d not in self._threads and d.is_dir():
+                t = threading.Thread(target=self._watch_dir, args=(d,), daemon=True)
+                self._threads[d] = t
+                t.start()
+
+    def _watch_dir(self, directory: Path) -> None:
+        kernel32 = ctypes.windll.kernel32
+        FILE_LIST_DIRECTORY = 0x0001
+        FILE_SHARE_READ = 0x0001
+        FILE_SHARE_WRITE = 0x0002
+        FILE_SHARE_DELETE = 0x0004
+        OPEN_EXISTING = 3
+        FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+        NOTIFY_FLAGS = 0x00000001 | 0x00000008 | 0x00000010  # FILE_NAME | SIZE | LAST_WRITE
+
+        h_dir = kernel32.CreateFileW(
+            str(directory),
+            FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+        if h_dir in (-1, 0, None):
+            return
+        buf = ctypes.create_string_buffer(8192)
+        bytes_returned = ctypes.c_ulong()
+        try:
+            while not self._stop.is_set():
+                ok = kernel32.ReadDirectoryChangesW(
+                    h_dir,
+                    buf,
+                    len(buf),
+                    True,
+                    NOTIFY_FLAGS,
+                    ctypes.byref(bytes_returned),
+                    None,
+                    None,
+                )
+                if not ok:
+                    time.sleep(1.0)
+                    continue
+                if bytes_returned.value > 0:
+                    self.change_event.set()
+        except Exception:
+            pass
+        finally:
+            try:
+                kernel32.CloseHandle(h_dir)
+            except Exception:
+                pass
+
+    def wait(self, timeout: float) -> bool:
+        fired = self.change_event.wait(timeout=timeout)
+        if fired:
+            self.change_event.clear()
+        return fired
+
+    def close(self) -> None:
+        self._stop.set()
+        self.change_event.set()
+
+
+class _InotifyWatcher:
+    """Immediate directory change detector on Linux via libc inotify."""
+    IN_CLOSE_WRITE = 0x00000008
+    IN_MOVED_TO = 0x00000080
+    IN_CREATE = 0x00000100
+
+    def __init__(self, libc: Any, fd: int):
+        self.libc = libc
+        self.fd = fd
+        self._wds: Dict[Path, int] = {}
+
+    @classmethod
+    def create(cls) -> Optional["_InotifyWatcher"]:
+        if is_windows():
+            return None
+        try:
+            lib_name = ctypes.util.find_library("c") or "libc.so.6"
+            libc = ctypes.CDLL(lib_name, use_errno=True)
+            if not hasattr(libc, "inotify_init1") or not hasattr(libc, "inotify_add_watch"):
+                return None
+            O_NONBLOCK = getattr(os, "O_NONBLOCK", 0o4000)
+            fd = libc.inotify_init1(O_NONBLOCK)
+            if fd < 0:
+                return None
+            return cls(libc, fd)
+        except Exception:
+            return None
+
+    def sync_dirs(self, dirs: List[Path]) -> None:
+        mask = self.IN_CLOSE_WRITE | self.IN_MOVED_TO | self.IN_CREATE
+        for d in dirs:
+            if d not in self._wds and d.is_dir():
+                try:
+                    wd = self.libc.inotify_add_watch(self.fd, os.fsencode(str(d)), mask)
+                    if wd >= 0:
+                        self._wds[d] = wd
+                except Exception:
+                    pass
+
+    def wait(self, timeout: float) -> bool:
+        try:
+            r, _, _ = select.select([self.fd], [], [], timeout)
+            if r:
+                while True:
+                    try:
+                        chunk = os.read(self.fd, 4096)
+                        if not chunk:
+                            break
+                    except BlockingIOError:
+                        break
+                return True
+        except Exception:
+            time.sleep(min(timeout, 2.0))
+        return False
+
+    def close(self) -> None:
+        try:
+            os.close(self.fd)
+        except Exception:
+            pass
+
+
+class _StatPollWatcher:
+    """Portable stat()-polling fallback (used on Termux/PRoot when inotify is unavailable)."""
+    def __init__(self, interval: float = 1.5):
+        self.interval = interval
+        self._dirs: List[Path] = []
+        self._snapshot: Dict[Path, Tuple[int, int]] = {}
+
+    def sync_dirs(self, dirs: List[Path]) -> None:
+        self._dirs = list(dirs)
+
+    def _take_snapshot(self) -> Dict[Path, Tuple[int, int]]:
+        snap: Dict[Path, Tuple[int, int]] = {}
+        for d in self._dirs:
+            try:
+                st = d.stat()
+                snap[d] = (getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)), st.st_size)
+                for item in d.iterdir():
+                    if _is_candidate_filename(item.name) or item.name.lower() == "bin":
+                        ist = item.stat()
+                        snap[item] = (getattr(ist, "st_mtime_ns", int(ist.st_mtime * 1e9)), ist.st_size)
+            except Exception:
+                pass
+        return snap
+
+    def wait(self, timeout: float) -> bool:
+        if not self._snapshot:
+            self._snapshot = self._take_snapshot()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(min(self.interval, max(0.1, deadline - time.time())))
+            cur = self._take_snapshot()
+            if cur != self._snapshot:
+                self._snapshot = cur
+                return True
+        return False
+
+    def close(self) -> None:
+        pass
+
+
+def _collect_all_watch_targets(root_path: Optional[Path] = None) -> List[Path]:
+    """Discover all candidate binaries plus any custom paths saved in config."""
+    grouped = get_categorized_targets(root_path)
+    targets: List[Path] = [b for sub in grouped.values() for b in sub]
+    seen = {t.resolve() for t in targets if t.exists()}
+    cfg = load_config()
+    for cat, p_str in cfg.get("custom_paths", {}).items():
+        p = Path(p_str)
+        if p.exists():
+            resolved = resolve_app_backend_binary(p, cat)
+            if resolved.is_file() and _is_candidate_binary(resolved):
+                r = resolved.resolve()
+                if r not in seen:
+                    seen.add(r)
+                    targets.append(resolved)
+    return targets
+
+
+def run_watch_loop(root_path: Optional[Path] = None, foreground: bool = True) -> None:
+    """Monitor Antigravity binaries and immediately patch updates non-disruptively."""
+    pid_path = get_pid_path()
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(str(os.getpid()), encoding="utf-8")
+
+    echo = foreground and sys.stdout.isatty()
+    change_event = threading.Event()
+    if is_windows():
+        watcher: Any = _WindowsDirWatcher(change_event)
+        backend_name = "ReadDirectoryChangesW"
+    else:
+        ino = _InotifyWatcher.create()
+        if ino is not None:
+            watcher = ino
+            backend_name = "inotify"
+        else:
+            watcher = _StatPollWatcher(interval=1.5)
+            backend_name = "stat-poll"
+
+    _watch_log(f"Watcher started (PID {os.getpid()}, backend={backend_name}).", echo=echo)
+
+    locked_retries: Dict[Path, Tuple[float, float]] = {}  # path -> (next_try_ts, backoff_sec)
+
+    def perform_pass(reason: str) -> None:
+        ag_active = bool(get_current_env_var(ENV_VAR_AG))
+        targets = _collect_all_watch_targets(root_path)
+        patched_names: List[str] = []
+        now = time.time()
+
+        for t in targets:
+            st = get_binary_status(t, ag_enabled=ag_active)
+            if st.get("error"):
+                continue
+            if st.get("is_patched"):
+                locked_retries.pop(t, None)
+                continue
+
+            res = patch_file(t, unpatch=False, patch_proxy=ag_active, allow_kill=False)
+            if res.locked:
+                _, prev_backoff = locked_retries.get(t, (0.0, 1.0))
+                next_backoff = min(30.0, prev_backoff * 2.0)
+                locked_retries[t] = (now + next_backoff, next_backoff)
+                _watch_log(f"Binary locked ({t.name}); will retry in {int(next_backoff)}s.", echo=echo)
+            elif res.error:
+                _watch_log(f"Patch error on {t}: {res.error}", echo=echo)
+            elif not res.already_patched:
+                locked_retries.pop(t, None)
+                patched_names.append(t.name)
+                _watch_log(
+                    f"Auto-patched {t} ({reason}; region={res.region_replaced}, proxy={res.proxy_replaced}).",
+                    echo=echo,
+                )
+
+        if patched_names:
+            summary = ", ".join(patched_names)
+            send_notification("Antigravity Auto-Patched", f"Patched after update: {summary}")
+
+    try:
+        watcher.sync_dirs(_get_watch_directories(root_path))
+        perform_pass("startup")
+
+        while True:
+            # Compute wait timeout based on locked retry queue
+            wait_timeout = 60.0
+            if locked_retries:
+                soonest = min(ts for ts, _ in locked_retries.values())
+                wait_timeout = max(0.5, min(15.0, soonest - time.time()))
+
+            event_fired = watcher.wait(wait_timeout)
+            if event_fired:
+                # Short debounce so installers/updaters finish writing binaries & sidecars
+                time.sleep(1.5)
+                watcher.sync_dirs(_get_watch_directories(root_path))
+                perform_pass("fs-event")
+            else:
+                watcher.sync_dirs(_get_watch_directories(root_path))
+                perform_pass("periodic-check")
+    except KeyboardInterrupt:
+        _watch_log("Watcher stopped by user.", echo=echo)
+    finally:
+        watcher.close()
+        try:
+            pid_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 class AppState:
     """In-memory cache for environment variables and binary inspection results."""
     def __init__(self, root_path: Optional[Path] = None, auto_refresh: bool = True):
@@ -1423,11 +2244,19 @@ class AppState:
         self.node_tls_env = None
         self.ag_saved_url = DEFAULT_PROXY_URL
         self.https_saved_url = DEFAULT_PROXY_URL
+        self.auto_patch = False
+        self.notifications = True
+        self.watcher_pid: Optional[int] = None
         self.apps: Dict[str, dict] = {
             cat: {"target": None, "status": None, "scanning": not auto_refresh}
             for cat in ALL_CATEGORIES
         }
-        self.custom_paths: Dict[str, Path] = {}
+        cfg = load_config()
+        self.custom_paths: Dict[str, Path] = {
+            cat: Path(p) for cat, p in cfg.get("custom_paths", {}).items() if p
+        }
+        self.auto_patch = bool(cfg.get("auto_patch", False))
+        self.notifications = bool(cfg.get("notifications", True))
         if auto_refresh:
             self.refresh()
 
@@ -1438,6 +2267,10 @@ class AppState:
         self.ag_env = get_current_env_var(ENV_VAR_AG)
         self.https_env = get_current_env_var(ENV_VAR_HTTPS)
         self.node_tls_env = get_current_env_var(ENV_VAR_NODE_TLS)
+        cfg = load_config()
+        self.auto_patch = bool(cfg.get("auto_patch", False))
+        self.notifications = bool(cfg.get("notifications", True))
+        self.watcher_pid = get_watcher_pid()
         if self.ag_env:
             self.ag_saved_url = self.ag_env
         if self.https_env:
@@ -1488,6 +2321,8 @@ def run_interactive_tui(root_path: Optional[Path] = None):
         {"type": "app", "category": AppCategory.DESKTOP},
         {"type": "app", "category": AppCategory.IDE},
         {"type": "app", "category": AppCategory.CLI},
+        {"type": "auto_patch", "name": "Auto-Patch Watchdog"},
+        {"type": "notifications", "name": "Watch Notifications"},
         {"type": "patch_all", "title": "Patch All Detected Applications"},
         {"type": "revert_all", "title": "Revert All Detected Applications"},
         {"type": "refresh", "title": "Refresh Status"},
@@ -1573,8 +2408,35 @@ def run_interactive_tui(root_path: Optional[Path] = None):
 
         if not compact:
             buf.append("")
+        buf.append(f"  {Colors.BOLD}--- [ AUTO-PATCH & SETTINGS ] ---{Colors.RESET}")
+
+        # 6: Auto-Patch Watchdog
+        is_cur = (selected_idx == 6)
+        c_str = f"{Colors.CYAN}>{Colors.RESET} " if is_cur else "  "
+        t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
+        if state.auto_patch:
+            ap_badge = Colors.BADGE_ENABLED
+            ap_detail = f"  (Running, PID {state.watcher_pid})" if state.watcher_pid else f"  {Colors.YELLOW}(Stopped){Colors.RESET}"
+        else:
+            ap_badge = Colors.BADGE_DISABLED
+            ap_detail = ""
+        buf.append(f"{c_str}{t_col}{'Auto-Patch Watchdog':<29}{Colors.RESET}: {ap_badge}{ap_detail}")
+        if is_cur or not compact:
+            buf.append(f"    {Colors.GRAY}Auto-patch binaries immediately after updates (log: {get_log_path()}){Colors.RESET}")
+
+        # 7: Watch Notifications
+        is_cur = (selected_idx == 7)
+        c_str = f"{Colors.CYAN}>{Colors.RESET} " if is_cur else "  "
+        t_col = f"{Colors.BOLD}{Colors.WHITE}" if is_cur else Colors.WHITE
+        nt_badge = Colors.BADGE_ENABLED if state.notifications else Colors.BADGE_DISABLED
+        buf.append(f"{c_str}{t_col}{'Watch Notifications':<29}{Colors.RESET}: {nt_badge}")
+        if is_cur or not compact:
+            buf.append(f"    {Colors.GRAY}Show OS desktop notification when an updated binary is auto-patched{Colors.RESET}")
+
+        if not compact:
+            buf.append("")
         buf.append(f"  {Colors.BOLD}--- [ ACTIONS ] ---{Colors.RESET}")
-        for idx in [6, 7, 8, 9]:
+        for idx in [8, 9, 10, 11]:
             item = items[idx]
             is_cur = (selected_idx == idx)
             c_str = f"{Colors.CYAN}>{Colors.RESET} " if is_cur else "  "
@@ -1776,6 +2638,9 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                                 if not candidate:
                                     return (False, "No valid binary found at specified path.")
                                 state.custom_paths[cat] = candidate
+                                cfg_cp = load_config()
+                                cfg_cp.setdefault("custom_paths", {})[cat] = str(candidate)
+                                save_config(cfg_cp)
                                 res = patch_file(
                                     candidate,
                                     unpatch=False,
@@ -1789,6 +2654,33 @@ def run_interactive_tui(root_path: Optional[Path] = None):
                                 return (True, f"Patched {candidate.name}")
 
                             run_with_spinner("Locating custom binary...", _custom_patch)
+
+                elif t == "auto_patch":
+                    if state.auto_patch:
+                        def _disable_auto(cb: Callable[[str], None]) -> Tuple[bool, str]:
+                            cb("Stopping watcher and removing auto-start...")
+                            ok, msg = disable_auto_patch()
+                            state.refresh(progress_cb=cb, sync_proxy=False)
+                            return ok, msg
+                        run_with_spinner("Disabling Auto-Patch Watchdog...", _disable_auto)
+                    else:
+                        def _enable_auto(cb: Callable[[str], None]) -> Tuple[bool, str]:
+                            cb("Registering auto-start and starting watcher...")
+                            ok, msg = enable_auto_patch()
+                            state.refresh(progress_cb=cb, sync_proxy=False)
+                            return ok, msg
+                        run_with_spinner("Enabling Auto-Patch Watchdog...", _enable_auto)
+
+                elif t == "notifications":
+                    def _toggle_notify(cb: Callable[[str], None]) -> Tuple[bool, str]:
+                        cfg_n = load_config()
+                        new_val = not bool(cfg_n.get("notifications", True))
+                        cfg_n["notifications"] = new_val
+                        ok = save_config(cfg_n)
+                        state.refresh(progress_cb=cb, sync_proxy=False)
+                        state_str = "enabled" if new_val else "disabled"
+                        return ok, (f"Watch notifications {state_str}." if ok else "Failed to save notification setting.")
+                    run_with_spinner("Updating notification setting...", _toggle_notify)
 
                 elif t == "patch_all":
                     all_targets = [v["target"] for v in state.apps.values() if v and v["target"]]
@@ -1955,6 +2847,41 @@ def main():
         action="store_true",
         help="Open interactive Terminal User Interface"
     )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Run background auto-patch watcher in foreground"
+    )
+    parser.add_argument(
+        "--watch-daemon",
+        action="store_true",
+        help="Ensure detached background auto-patch watcher is running and exit"
+    )
+    parser.add_argument(
+        "--enable-auto",
+        action="store_true",
+        help="Enable auto-patching after updates, register OS auto-start, and start watcher"
+    )
+    parser.add_argument(
+        "--disable-auto",
+        action="store_true",
+        help="Disable auto-patching, stop watcher, and remove OS auto-start"
+    )
+    parser.add_argument(
+        "--enable-notify",
+        action="store_true",
+        help="Enable OS notifications when auto-patcher patches an update"
+    )
+    parser.add_argument(
+        "--disable-notify",
+        action="store_true",
+        help="Disable OS notifications for auto-patcher"
+    )
+    parser.add_argument(
+        "--watch-log",
+        action="store_true",
+        help="Print recent auto-patch watcher log entries and status"
+    )
 
     args = parser.parse_args()
 
@@ -1977,6 +2904,61 @@ def main():
         return
 
     root_path = Path(args.path).resolve() if args.path else None
+
+    if args.watch:
+        run_watch_loop(root_path=root_path, foreground=True)
+        return
+
+    if args.watch_daemon:
+        cfg = load_config()
+        if not cfg.get("auto_patch", False):
+            return
+        start_watcher_background()
+        return
+
+    if args.enable_auto:
+        sp = CliSpinner("Enabling Auto-Patch Watchdog...").start()
+        ok, msg = enable_auto_patch()
+        sp.finish(msg, ok=ok)
+        print(f"[{'+' if ok else '-'}] {msg}")
+        return
+
+    if args.disable_auto:
+        sp = CliSpinner("Disabling Auto-Patch Watchdog...").start()
+        ok, msg = disable_auto_patch()
+        sp.finish(msg, ok=ok)
+        print(f"[{'+' if ok else '-'}] {msg}")
+        return
+
+    if args.enable_notify:
+        cfg = load_config()
+        cfg["notifications"] = True
+        ok = save_config(cfg)
+        print("[+] Watch notifications enabled." if ok else "[-] Failed to save configuration.")
+        return
+
+    if args.disable_notify:
+        cfg = load_config()
+        cfg["notifications"] = False
+        ok = save_config(cfg)
+        print("[+] Watch notifications disabled." if ok else "[-] Failed to save configuration.")
+        return
+
+    if args.watch_log:
+        cfg = load_config()
+        pid = get_watcher_pid()
+        print(f"[*] Auto-Patch Watchdog: {'Enabled' if cfg.get('auto_patch') else 'Disabled'} | Process: {f'Running (PID {pid})' if pid else 'Stopped'}")
+        print(f"[*] Watch Notifications: {'Enabled' if cfg.get('notifications', True) else 'Disabled'}")
+        lp = get_log_path()
+        print(f"[*] Log file: {lp}")
+        if lp.is_file():
+            lines = lp.read_text(encoding="utf-8", errors="replace").splitlines()
+            print("\n--- Recent watch.log ---")
+            for ln in lines[-30:]:
+                print(ln)
+        else:
+            print("[*] No watch log entries yet.")
+        return
 
     if args.tui:
         run_interactive_tui(root_path)
@@ -2080,6 +3062,11 @@ def main():
     print(f"[*] {ENV_VAR_HTTPS}: {cur_https or '<Not Set>'}  (Default global proxy env used by all apps)")
     tls_badge = f"{cur_tls} [Bypassed]" if cur_tls == "0" else (cur_tls or "<Not Set>")
     print(f"[*] {ENV_VAR_NODE_TLS}: {tls_badge}  (Bypass expired internal TLS cert for language_server)")
+    cfg_st = load_config()
+    wpid = get_watcher_pid()
+    ap_str = f"Enabled ({f'Running, PID {wpid}' if wpid else 'Stopped'})" if cfg_st.get("auto_patch") else "Disabled"
+    nt_str = "Enabled" if cfg_st.get("notifications", True) else "Disabled"
+    print(f"[*] Auto-Patch Watchdog: {ap_str} | Notifications: {nt_str}")
 
     if args.status:
         for cat in ALL_CATEGORIES:
