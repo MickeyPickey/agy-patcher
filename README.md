@@ -1,4 +1,4 @@
-# Antigravity Patcher v1.4.4
+# Antigravity Patcher v1.5.0
 
 [Русский](#русский) | [English](#english)
 
