@@ -31,7 +31,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 # Byte signatures (Exact length match is mandatory)
 SIG_REGION_FROM = b"ineligible"   # 10 bytes
@@ -1689,11 +1689,26 @@ def get_self_launch_command() -> List[str]:
     return [str(Path(sys.executable).resolve()), str(Path(__file__).resolve())]
 
 
+def _clean_subprocess_env() -> Dict[str, str]:
+    """Return environment dict with PyInstaller _MEIPASS paths stripped so child processes don't lock temp dirs."""
+    env = os.environ.copy()
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        meipass_norm = os.path.normcase(os.path.normpath(meipass))
+        path_val = env.get("PATH", "")
+        parts = [p for p in path_val.split(os.pathsep) if os.path.normcase(os.path.normpath(p)) != meipass_norm]
+        env["PATH"] = os.pathsep.join(parts)
+    for k in ("_MEIPASS2", "PYTHONHOME", "PYTHONPATH"):
+        env.pop(k, None)
+    return env
+
+
 def start_watcher_background() -> bool:
     """Spawn detached background watcher if not already running."""
     if get_watcher_pid() is not None:
         return True
     cmd = get_self_launch_command() + ["--watch"]
+    env = _clean_subprocess_env()
     try:
         if is_windows():
             flags = (
@@ -1706,6 +1721,8 @@ def start_watcher_background() -> bool:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=env,
+                close_fds=True,
                 creationflags=flags,
             )
         else:
@@ -1714,6 +1731,8 @@ def start_watcher_background() -> bool:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=env,
+                close_fds=True,
                 start_new_session=True,
             )
         deadline = time.time() + 1.5
@@ -1787,6 +1806,11 @@ def _strip_shell_autostart(rc_file: Path) -> bool:
         return False
 
 
+def _get_win_startup_vbs_path() -> Path:
+    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / f"{WIN_TASK_NAME}.vbs"
+
+
 def register_autostart() -> bool:
     """Register OS-native auto-start for the background watcher."""
     cmd = get_self_launch_command() + ["--watch"]
@@ -1797,21 +1821,32 @@ def register_autostart() -> bool:
             quoted_cmd = " ".join(f'""{c}""' for c in cmd)
             vbs_content = f'CreateObject("WScript.Shell").Run "{quoted_cmd}", 0, False\r\n'
             vbs_path.write_text(vbs_content, encoding="utf-8")
-            tr = f'wscript.exe //B //Nologo "{vbs_path}"'
+
+            # Use Register-ScheduledTask so battery mode and 72h timeout don't block/kill the watcher
+            vbs_esc = str(vbs_path).replace("'", "''")
+            ps_script = (
+                f"$act = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument '//B //Nologo \"{vbs_esc}\"'; "
+                "$trg = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME; "
+                "$set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
+                "-StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Seconds 0); "
+                f"Register-ScheduledTask -TaskName '{WIN_TASK_NAME}' -Action $act -Trigger $trg -Settings $set -Force | Out-Null"
+            )
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
             res = subprocess.run(
-                [
-                    "schtasks", "/Create",
-                    "/TN", WIN_TASK_NAME,
-                    "/TR", tr,
-                    "/SC", "ONLOGON",
-                    "/RL", "LIMITED",
-                    "/F",
-                ],
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                creationflags=creation_flags,
                 check=False,
             )
-            return res.returncode == 0
+            if res.returncode == 0:
+                return True
+
+            # Fallback to Startup folder VBS if ScheduledTask registration is blocked
+            startup_vbs = _get_win_startup_vbs_path()
+            startup_vbs.parent.mkdir(parents=True, exist_ok=True)
+            startup_vbs.write_text(vbs_content, encoding="utf-8")
+            return True
         except Exception:
             return False
 
@@ -1885,6 +1920,10 @@ def unregister_autostart() -> None:
             pass
         try:
             _get_win_vbs_path().unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            _get_win_startup_vbs_path().unlink(missing_ok=True)
         except Exception:
             pass
         return
